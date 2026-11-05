@@ -1,137 +1,127 @@
-'use strict';
-// re:Invent 2026 출장 일정 웹앱
-// - data.enc.json(암호화된 일정·장소)을 받아 이 기기에 저장하고, 오프라인이면 저장본을 보여줍니다.
-// - 비밀번호는 처음 한 번만 묻고, 풀린 키를 이 기기에만 보관합니다.
+// re:Invent 2026 출장 일정 웹앱 (Firebase 버전)
+// - 보기: 공용 비밀번호로 한 번 로그인하면 이 기기에 기억됩니다.
+// - 데이터: Firestore 실시간 반영 + 기기 저장(오프라인이면 마지막 저장본, 오프라인 편집은 연결되면 업로드).
+// - 편집: 편집 비밀번호를 넣어야 편집 모드가 켜집니다(실수 방지용).
+import {
+  initializeApp, initializeAuth, indexedDBLocalPersistence, browserLocalPersistence, signInWithEmailAndPassword, signOut,
+  onAuthStateChanged, connectAuthEmulator, initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+  connectFirestoreEmulator, collection, doc, onSnapshot, setDoc, deleteDoc, serverTimestamp, getDocsFromServer,
+  terminate, clearIndexedDbPersistence, enableNetwork,
+} from './vendor/firebase.js';
+import { firebaseConfig, VIEWER_EMAIL, viewerPassword, emulator } from './firebase-config.js';
 
-const APP_VERSION = '1.0.0';
-const DATA_URL = 'data.enc.json';
-const K = { key: 'rv.key', keyId: 'rv.keyId', enc: 'rv.enc', fetchedAt: 'rv.fetchedAt', person: 'rv.person', tab: 'rv.tab', cat: 'rv.cat' };
+const APP_VERSION = '2.0.0';
+const COLS = ['sessions', 'places', 'meta'];
+const K = { person: 'rv.person', tab: 'rv.tab', cat: 'rv.cat', lastSync: 'rv.lastSync' };
 const store = {
   get(k) { try { return localStorage.getItem(k); } catch { return null; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch { /* 저장 불가 환경 */ } },
   del(k) { try { localStorage.removeItem(k); } catch { /* 무시 */ } },
 };
+// 이전 버전(암호화 파일 방식)이 남긴 값 정리
+['rv.key', 'rv.keyId', 'rv.enc', 'rv.fetchedAt'].forEach(store.del);
 
 const S = {
-  enc: null, data: null, key: null, model: null,
-  fetchedAt: store.get(K.fetchedAt), online: navigator.onLine, syncing: false,
+  user: null, raw: { sessions: [], places: [], meta: [] }, ready: {}, fromCache: {}, pending: 0, model: null,
   tab: store.get(K.tab) || 'schedule', person: store.get(K.person) || '', cat: store.get(K.cat) || 'all',
-  day: null, query: '', open: new Set(), installEvt: null,
+  day: null, query: '', open: new Set(), edit: false, checking: false, installEvt: null,
+  lastSync: store.get(K.lastSync), sheet: null,
 };
+let fb = null;
+let unsubs = [];
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const linkify = s => esc(s).replace(/https?:\/\/[^\s<>"')]+/g, u => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`);
 const pad = n => String(n).padStart(2, '0');
 
-/* ---------- 암호화 ---------- */
-const b64d = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
-const b64e = buf => { let s = ''; for (const b of new Uint8Array(buf)) s += String.fromCharCode(b); return btoa(s); };
-const kdfId = enc => `${enc.kdf.salt}:${enc.kdf.iterations}`;
-
-async function deriveKey(pass, kdf) {
-  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt: b64d(kdf.salt), iterations: kdf.iterations }, base, { name: 'AES-GCM', length: 256 }, true, ['decrypt']);
-}
-async function decryptWith(key, enc) {
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(enc.iv) }, key, b64d(enc.ct));
-  return JSON.parse(new TextDecoder().decode(pt));
-}
-async function tryStoredKey() {
-  if (!S.enc || store.get(K.keyId) !== kdfId(S.enc)) return false;
-  const raw = store.get(K.key);
-  if (!raw) return false;
+/* ---------- Firebase ---------- */
+function initFirebase() {
+  const app = initializeApp(firebaseConfig);
+  const auth = initializeAuth(app, { persistence: [indexedDBLocalPersistence, browserLocalPersistence] });
+  let db;
   try {
-    const key = await crypto.subtle.importKey('raw', b64d(raw), { name: 'AES-GCM' }, false, ['decrypt']);
-    setData(await decryptWith(key, S.enc));
-    S.key = key;
-    return true;
-  } catch { return false; }
-}
-
-/* ---------- 데이터 받기·동기화 ---------- */
-async function fetchRemote() {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15000);
-  try {
-    const res = await fetch(`${DATA_URL}?t=${Date.now()}`, { cache: 'no-store', signal: ctrl.signal });
-    if (!res.ok) throw new Error(String(res.status));
-    const enc = await res.json();
-    if (!enc || !enc.ct || !enc.kdf) throw new Error('format');
-    S.online = true;
-    return enc;
+    db = initializeFirestore(app, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) });
   } catch {
-    S.online = false;
-    return null;
-  } finally { clearTimeout(timer); }
-}
-
-async function applyRemote(enc, manual) {
-  S.fetchedAt = new Date().toISOString();
-  store.set(K.fetchedAt, S.fetchedAt);
-  const same = S.enc && S.enc.ct === enc.ct;
-  S.enc = enc;
-  store.set(K.enc, JSON.stringify(enc));
-  if (!S.data) {
-    if (await tryStoredKey()) showApp(); else showLock();
-    return;
+    db = initializeFirestore(app, {});
   }
-  if (same) { if (manual) toast('이미 최신 내용이에요.'); renderHeader(); return; }
-  const prev = S.data;
-  try {
-    const next = S.key && store.get(K.keyId) === kdfId(enc) ? await decryptWith(S.key, enc) : null;
-    if (!next) throw new Error('key');
-    setData(next);
-    render();
-    toast(changeSummary(prev, next));
-  } catch {
-    S.data = null; S.key = null; S.model = null;
-    store.del(K.key); store.del(K.keyId);
-    showLock('비밀번호가 바뀌었어요. 새 비밀번호를 입력해주세요.');
+  if (emulator) {
+    connectAuthEmulator(auth, `http://${emulator.host}:${emulator.authPort}`, { disableWarnings: true });
+    connectFirestoreEmulator(db, emulator.host, emulator.firestorePort);
+  }
+  return { app, auth, db };
+}
+
+function startListeners() {
+  if (unsubs.length) return;
+  for (const c of COLS) {
+    S.ready[c] = false; S.fromCache[c] = true;
+    unsubs.push(onSnapshot(collection(fb.db, c), { includeMetadataChanges: true }, snap => {
+      S.raw[c] = snap.docs.map(d => ({ ...d.data(), id: d.id, _pending: d.metadata.hasPendingWrites }));
+      S.ready[c] = true;
+      S.fromCache[c] = snap.metadata.fromCache;
+      onData();
+    }, err => {
+      console.warn(c, err);
+      if (err.code === 'permission-denied') toast('데이터를 볼 권한이 없어요. 비밀번호를 다시 입력해주세요.');
+    }));
   }
 }
+function stopListeners() { unsubs.forEach(u => u()); unsubs = []; }
 
-async function sync(manual) {
-  if (S.syncing) return;
-  S.syncing = true; renderHeader();
-  const enc = await fetchRemote();
-  S.syncing = false;
-  if (enc) await applyRemote(enc, manual);
-  else if (manual) toast('인터넷에 연결되어 있지 않아요. 마지막으로 받은 내용을 보여드려요.');
-  renderHeader();
+let frame = 0;
+function onData() {
+  S.pending = COLS.reduce((n, c) => n + S.raw[c].filter(d => d._pending).length, 0);
+  if (COLS.every(c => S.ready[c]) && COLS.every(c => !S.fromCache[c]) && !S.pending) {
+    S.lastSync = new Date().toISOString();
+    store.set(K.lastSync, S.lastSync);
+  }
+  S.model = buildModel();
+  if (frame) return;
+  frame = requestAnimationFrame(() => {
+    frame = 0;
+    if (!S.day && S.model.days.length) S.day = defaultDay();
+    renderHeader();
+    if (S.tab === 'schedule' && $('schedBody')) renderScheduleBody();
+    else render();
+  });
 }
 
-function changeSummary(prev, next) {
-  const diff = col => {
-    const a = new Map((prev.collections[col] || []).map(d => [d.id, d.version]));
-    const b = new Map((next.collections[col] || []).map(d => [d.id, d.version]));
-    let add = 0, mod = 0, del = 0;
-    for (const [id, v] of b) { if (!a.has(id)) add++; else if (a.get(id) !== v) mod++; }
-    for (const id of a.keys()) if (!b.has(id)) del++;
-    return add + mod + del ? `${add ? `추가 ${add}` : ''}${mod ? ` 수정 ${mod}` : ''}${del ? ` 삭제 ${del}` : ''}`.trim() : '';
-  };
-  const parts = [['일정', diff('sessions')], ['장소', diff('places')]].filter(p => p[1]).map(p => `${p[0]} ${p[1]}`);
-  return parts.length ? `새 내용을 받았어요 · ${parts.join(' · ')}` : '새 내용을 받았어요.';
+async function checkServer() {
+  if (S.checking) return;
+  if (!navigator.onLine) { toast('인터넷에 연결되어 있지 않아요. 마지막 저장본을 보여드려요.'); return; }
+  S.checking = true; renderHeader();
+  try {
+    await enableNetwork(fb.db);
+    await Promise.race([
+      Promise.all(COLS.map(c => getDocsFromServer(collection(fb.db, c)))),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 12000)),
+    ]);
+    S.lastSync = new Date().toISOString(); store.set(K.lastSync, S.lastSync);
+    toast(S.pending ? `최신 상태예요. 올라가길 기다리는 변경 ${S.pending}건이 있어요.` : '최신 상태예요. 고친 내용은 자동으로 바로 반영돼요.');
+  } catch {
+    toast('서버에 연결하지 못했어요. 마지막 저장본을 보여드려요.');
+  } finally { S.checking = false; renderHeader(); }
 }
 
 /* ---------- 데이터 정리 ---------- */
-function setData(payload) { S.data = payload; S.model = buildModel(payload); }
-
-function buildModel(p) {
-  const c = p.collections;
-  const metaDoc = (c.meta || []).find(d => d.id === 'trip') || (c.meta || [])[0];
-  const meta = { title: 'AWS re:Invent 2026', start: '', end: '', location: '', note: '', ...(metaDoc ? metaDoc.data : {}) };
-  const sessions = (c.sessions || []).map(d => ({ ...d.data, id: d.id, attendees: d.data.attendees || [] }))
+function buildModel() {
+  const metaDoc = S.raw.meta.find(d => d.id === 'trip');
+  const settings = S.raw.meta.find(d => d.id === 'settings') || {};
+  const meta = { title: 'AWS re:Invent 2026', start: '', end: '', location: '', note: '', ...(metaDoc || {}) };
+  const sessions = S.raw.sessions.map(d => ({ ...d, attendees: Array.isArray(d.attendees) ? d.attendees : [] }))
     .sort((a, b) => (a.date || '').localeCompare(b.date || '') || (a.start || '99').localeCompare(b.start || '99') || (a.title || '').localeCompare(b.title || ''));
-  const places = (c.places || []).map(d => ({ ...d.data, id: d.id }));
+  const places = S.raw.places.map(d => ({ ...d }));
   const hotel = places.find(x => x.h === '숙소') || null;
   let people = [];
   const widest = sessions.reduce((m, s) => (s.attendees.length > (m ? m.attendees.length : 0) ? s : m), null);
   if (widest) people = [...widest.attendees];
   for (const s of sessions) for (const a of s.attendees) if (!people.includes(a)) people.push(a);
   const dates = new Set(sessions.map(s => s.date).filter(Boolean));
-  if (meta.start && meta.end) for (let d = meta.start; d <= meta.end; d = addDays(d, 1)) dates.add(d);
-  return { meta, sessions, places, hotel, people, days: [...dates].sort() };
+  if (/^\d{4}-\d{2}-\d{2}$/.test(meta.start) && /^\d{4}-\d{2}-\d{2}$/.test(meta.end) && meta.start <= meta.end) {
+    for (let d = meta.start, i = 0; d <= meta.end && i < 60; d = addDays(d, 1), i++) dates.add(d);
+  }
+  return { meta, settings, sessions, places, hotel, people, days: [...dates].sort() };
 }
 
 /* ---------- 날짜·시간 ---------- */
@@ -151,7 +141,6 @@ function stamp(iso) {
   return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 function fmtAt(at) {
-  // "2026-12-03 18:00–21:00" 또는 "2026-11-30~12-03 09:00–17:00"
   const m = /^(\d{4})-(\d{2})-(\d{2})(?:~(\d{2})-(\d{2}))?\s*(.*)$/.exec(at || '');
   if (!m) return at || '';
   const a = `${m[1]}-${m[2]}-${m[3]}`;
@@ -173,7 +162,7 @@ const CATS = [
 const catOf = p => CATS.find(c => c[0] === p.c) || ['etc', '기타', '기타'];
 
 function distKm(a, b) {
-  if (!a || !b) return null;
+  if (!Array.isArray(a) || !Array.isArray(b)) return null;
   const R = 6371, r = x => x * Math.PI / 180;
   const dLat = r(b[0] - a[0]), dLng = r(b[1] - a[1]);
   const h = Math.sin(dLat / 2) ** 2 + Math.cos(r(a[0])) * Math.cos(r(b[0])) * Math.sin(dLng / 2) ** 2;
@@ -185,7 +174,7 @@ function distText(p) {
   if (p.id === H.id) return '숙소';
   const km = distKm(H.ll, p.ll);
   if (km == null) return '';
-  return km < 1 ? `숙소에서 ${Math.round(km * 1000 / 10) * 10}m` : `숙소에서 ${km.toFixed(1)}km`;
+  return km < 1 ? `숙소에서 ${Math.round(km * 100) * 10}m` : `숙소에서 ${km.toFixed(1)}km`;
 }
 function placeMapUrl(p) {
   if (p.map) return p.map;
@@ -201,17 +190,15 @@ const sessionsForPlace = p => p.m ? S.model.sessions.filter(s => matchText(s).in
 function showLock(msg) {
   $('app').hidden = true;
   $('lock').hidden = false;
+  closeSheet();
   const m = $('lockMsg');
-  if (msg) { m.textContent = msg; m.className = 'lock-msg'; }
-  else if (!S.enc) { m.textContent = S.online ? '데이터를 받는 중…' : '인터넷에 연결한 뒤 다시 열어주세요. 처음 한 번은 데이터를 받아야 해요.'; m.className = 'lock-msg ok'; }
-  else { m.textContent = ''; }
-  $('unlockBtn').disabled = !S.enc;
+  if (!fb) { m.textContent = '앱 설정이 아직 끝나지 않았어요.'; m.className = 'lock-msg ok'; $('unlockBtn').disabled = true; }
+  else { m.textContent = msg || ''; m.className = 'lock-msg'; $('unlockBtn').disabled = false; }
   $('lockInstall').innerHTML = installHtml(true);
 }
 function showApp() {
   $('lock').hidden = true;
   $('app').hidden = false;
-  if (!S.day) S.day = defaultDay();
   render();
 }
 function defaultDay() {
@@ -222,23 +209,43 @@ function defaultDay() {
 }
 
 function render() {
-  if (!S.data) return;
   renderHeader();
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === S.tab));
+  const fab = $('fab');
+  fab.hidden = !(S.edit && S.model && (S.tab === 'schedule' || S.tab === 'places'));
+  fab.textContent = S.tab === 'places' ? '+ 장소 추가' : '+ 일정 추가';
+  $('editBar').hidden = !S.edit;
+  document.body.classList.toggle('editing', S.edit);
+  if (!S.model || !COLS.every(c => S.ready[c])) { $('view').innerHTML = '<p class="empty">일정을 불러오는 중…</p>'; return; }
+  if (!S.raw.sessions.length && !S.raw.places.length) {
+    $('view').innerHTML = `<p class="empty">아직 등록된 일정이 없어요.${S.edit ? '' : '<br>위쪽 <b>편집</b>을 눌러 추가할 수 있어요.'}</p>`;
+    if (S.tab === 'info') renderInfo();
+    return;
+  }
   if (S.tab === 'places') renderPlaces();
   else if (S.tab === 'info') renderInfo();
   else renderSchedule();
 }
 
 function renderHeader() {
-  if (!S.model) return;
-  const { meta } = S.model;
+  const meta = S.model ? S.model.meta : { title: 're:Invent 2026' };
   $('tTitle').textContent = meta.title || 're:Invent 2026';
   $('tSub').textContent = [meta.location, meta.start && meta.end ? `${md(meta.start)}–${md(meta.end)}` : ''].filter(Boolean).join(' · ');
   const pill = $('syncPill');
-  pill.classList.toggle('busy', S.syncing);
-  pill.classList.toggle('offline', !S.online && !S.syncing);
-  $('syncText').textContent = S.syncing ? '동기화 중' : S.online ? `${stamp(S.fetchedAt)} 동기화` : `오프라인 · ${stamp(S.fetchedAt) || '저장본'}`;
+  const allReady = COLS.every(c => S.ready[c]);
+  const cached = COLS.some(c => S.fromCache[c]);
+  let text, warn = false;
+  if (S.checking) text = '확인 중';
+  else if (!navigator.onLine) { text = `오프라인 ${stamp(S.lastSync)}`.trim(); warn = true; }
+  else if (S.pending) { text = `대기 ${S.pending}건`; warn = true; }
+  else if (!allReady || cached) { text = '연결 중'; warn = true; }
+  else text = '실시간';
+  $('syncText').textContent = text;
+  pill.classList.toggle('busy', S.checking);
+  pill.classList.toggle('offline', warn);
+  const eb = $('editBtn');
+  eb.classList.toggle('on', S.edit);
+  $('editText').textContent = S.edit ? '완료' : '편집';
 }
 
 /* ---------- 일정 ---------- */
@@ -248,9 +255,7 @@ const ICON_MAP = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-6
 const ICON_LINK = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 const forPerson = s => !S.person || !s.attendees.length || s.attendees.includes(S.person);
-function matchesQuery(s, q) {
-  return [s.title, s.location, s.note, s.people, s.type, s.track].some(v => String(v || '').toLowerCase().includes(q));
-}
+const matchesQuery = (s, q) => [s.title, s.location, s.note, s.people, s.type, s.track].some(v => String(v || '').toLowerCase().includes(q));
 
 function renderSchedule() {
   const { people } = S.model;
@@ -267,7 +272,7 @@ function renderSchedule() {
 
 function renderScheduleBody() {
   const box = $('schedBody');
-  if (!box) return;
+  if (!box || !S.model) return;
   const q = S.query.trim().toLowerCase();
   const list = S.model.sessions.filter(forPerson);
   if (q) {
@@ -317,7 +322,7 @@ function sessionCard(s, d) {
     <button class="card-main" data-act="toggle" data-v="${esc(s.id)}" aria-expanded="${open}">
       <div class="time"><b>${esc(s.start || '—')}</b>${s.end ? `<span>${esc(s.end)}</span>` : ''}</div>
       <div class="body">
-        <div class="badges"><span class="badge ${cls}">${esc(label)}</span>${s.track === 'Security' ? '<span class="badge sec">Security</span>' : ''}${st === 'now' ? '<span class="badge now">진행 중</span>' : ''}${isNext ? '<span class="badge next">다음</span>' : ''}</div>
+        <div class="badges"><span class="badge ${cls}">${esc(label)}</span>${s.track === 'Security' ? '<span class="badge sec">Security</span>' : ''}${st === 'now' ? '<span class="badge now">진행 중</span>' : ''}${isNext ? '<span class="badge next">다음</span>' : ''}${s._pending ? '<span class="badge memo">저장 대기</span>' : ''}</div>
         <h3>${esc(s.title || '(제목 없음)')}</h3>
         ${s.location ? `<p class="loc">${esc(s.location)}</p>` : ''}
         ${who ? `<p class="who">${esc(who)}</p>` : ''}
@@ -338,8 +343,9 @@ function sessionDetail(s) {
     ${s.note ? `<div class="note">${linkify(s.note)}</div>` : ''}
     <div class="actions">
       ${mapUrl && !travel ? `<a class="btn" href="${esc(mapUrl)}" target="_blank" rel="noopener">${ICON_MAP}${p ? esc(p.k || p.n) : '지도에서 보기'}</a>` : ''}
-      ${p ? `<button class="btn" data-act="goPlace" data-v="${esc(p.id)}">장소 안내 보기</button>` : ''}
+      ${p ? `<button class="btn" type="button" data-act="goPlace" data-v="${esc(p.id)}">장소 안내 보기</button>` : ''}
     </div>
+    ${S.edit ? `<div class="actions edit-actions"><button class="btn primary" type="button" data-act="editSession" data-v="${esc(s.id)}">수정</button><button class="btn danger" type="button" data-act="delSession" data-v="${esc(s.id)}">삭제</button></div>` : ''}
   </div>`;
 }
 
@@ -378,6 +384,7 @@ function placeCard(p) {
           ${p.pr ? `<span class="badge">${esc(p.pr)}</span>` : ''}
           ${p.memo ? `<span class="badge memo">${esc(p.memo)}</span>` : ''}
           ${linked.length ? `<span class="badge sem">일정 ${linked.map(s => md(s.date)).filter((v, i, a) => a.indexOf(v) === i).join('·')}</span>` : ''}
+          ${p._pending ? '<span class="badge memo">저장 대기</span>' : ''}
         </div>
         <h3>${esc(p.k || p.n)}${p.k && p.n && p.k !== p.n ? `<small>${esc(p.n)}</small>` : ''}</h3>
         ${mz && p.at ? `<p class="when">${esc(fmtAt(p.at))}</p>` : ''}
@@ -394,6 +401,7 @@ function placeCard(p) {
         <a class="btn primary" href="${esc(placeMapUrl(p))}" target="_blank" rel="noopener">${ICON_MAP}지도</a>
         ${p.w ? `<a class="btn" href="${esc(p.w)}" target="_blank" rel="noopener">${ICON_LINK}웹사이트</a>` : ''}
       </div>
+      ${S.edit ? `<div class="actions edit-actions"><button class="btn primary" type="button" data-act="editPlace" data-v="${esc(p.id)}">수정</button><button class="btn danger" type="button" data-act="delPlace" data-v="${esc(p.id)}">삭제</button></div>` : ''}
     </div>` : ''}
   </li>`;
 }
@@ -411,12 +419,11 @@ function installHtml(onLock) {
   }
   return `<div class="install ${onLock ? '' : 'panel'}"><h3>홈 화면에 앱으로 설치하기</h3>
     <ol><li>Chrome 오른쪽 위 <b>⋮</b> 메뉴를 누르세요.</li><li><b>홈 화면에 추가</b> 또는 <b>앱 설치</b>를 누르세요.</li></ol>
-    ${S.installEvt ? '<div class="actions"><button class="btn green" data-act="install">지금 설치</button></div>' : ''}</div>`;
+    ${S.installEvt ? '<div class="actions"><button class="btn green" type="button" data-act="install">지금 설치</button></div>' : ''}</div>`;
 }
 
 function renderInfo() {
   const { meta, people, sessions, places } = S.model;
-  const d = S.data;
   $('view').innerHTML = `
     <div class="hero">
       <small>EXECUTIVE TRIP PLANNER</small>
@@ -426,39 +433,235 @@ function renderInfo() {
         ${meta.start && meta.end ? `<span>${esc(dayLabel(meta.start))} ~ ${esc(dayLabel(meta.end))}</span>` : ''}
         ${meta.location ? `<span>${esc(meta.location)}</span>` : ''}
       </div>
+      ${S.edit ? '<div class="actions"><button class="btn primary" type="button" data-act="editTrip">여행 정보 수정</button></div>' : ''}
     </div>
     <div class="panel">
       <h3>출장자</h3>
       <p>${people.map(esc).join(' · ') || '—'}</p>
-      <p class="muted">일정 ${sessions.length}건 · 맛집·장소 ${places.length}건</p>
+      <p class="muted">일정 ${sessions.length}건 · 맛집·장소 ${places.length}건 · 출장자 목록은 일정의 참석자에서 자동으로 모아요.</p>
     </div>
     <div class="panel">
       <h3>동기화</h3>
       <dl class="rows">
-        <dt>이 기기가 받은 시각</dt><dd>${esc(stamp(S.fetchedAt) || '—')}${S.online ? '' : ' (지금 오프라인)'}</dd>
-        <dt>원본 마지막 수정</dt><dd>${esc(stamp(d.sourceUpdatedAt) || '—')}</dd>
-        <dt>앱에 반영한 시각</dt><dd>${esc(stamp(d.generatedAt) || '—')}</dd>
+        <dt>상태</dt><dd>${esc({ '실시간': '실시간 연결됨' }[$('syncText').textContent] || $('syncText').textContent)}</dd>
+        <dt>마지막으로 서버와 맞춘 시각</dt><dd>${esc(stamp(S.lastSync) || '—')}</dd>
       </dl>
-      <p class="muted">‘지금 동기화’는 앱에 올라간 최신본을 받아와요. 원본 플래너에서 고친 내용은 앱에 반영된 뒤에 나타나요. 인터넷이 끊기면 마지막으로 받은 내용을 그대로 보여드려요.</p>
-      <div class="actions"><button class="btn green" data-act="sync" ${S.syncing ? 'disabled' : ''}>지금 동기화</button>
-      ${d.sourceUrl ? `<a class="btn" href="${esc(d.sourceUrl)}" target="_blank" rel="noopener">${ICON_LINK}원본 플래너</a>` : ''}</div>
+      <p class="muted">누군가 고치면 몇 초 안에 모두의 화면에 반영돼요. 인터넷이 끊기면 마지막 저장본을 보여주고, 그동안 고친 내용은 연결되면 자동으로 올라가요.</p>
+      <div class="actions"><button class="btn green" type="button" data-act="check" ${S.checking ? 'disabled' : ''}>지금 확인</button></div>
+    </div>
+    <div class="panel">
+      <h3>편집</h3>
+      <p class="muted">위쪽 <b>편집</b> 버튼을 누르고 편집 비밀번호를 넣으면 일정과 장소를 추가·수정·삭제할 수 있어요. ${S.model.settings.editHash ? '' : '아직 편집 비밀번호가 없어서, 처음 편집할 때 정하게 돼요.'}</p>
+      ${S.edit ? '<div class="actions"><button class="btn" type="button" data-act="setEditPw">편집 비밀번호 바꾸기</button></div>' : ''}
     </div>
     ${installHtml(false)}
     <div class="panel">
       <h3>이 기기</h3>
-      <p class="muted">기억된 비밀번호와 저장된 일정을 이 기기에서 지웁니다. 다시 열면 비밀번호를 물어요.</p>
-      <div class="actions"><button class="btn danger" data-act="forget">이 기기에서 지우기</button></div>
+      <p class="muted">로그인 정보와 이 기기에 저장된 일정을 지웁니다. 다시 열면 비밀번호를 물어요.</p>
+      <div class="actions"><button class="btn danger" type="button" data-act="forget">이 기기에서 지우기</button></div>
     </div>
-    <p class="foot">버전 ${APP_VERSION} · 일정과 장소 정보는 원본 플래너 기준이며, 행사 시간과 영업시간은 공식 안내를 확인하세요.</p>`;
+    <p class="foot">버전 ${APP_VERSION} · 행사 시간과 영업시간은 공식 안내를 확인하세요.</p>`;
+}
+
+/* ---------- 편집 ---------- */
+async function sha256hex(s) {
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+function randHex(n) { return [...crypto.getRandomValues(new Uint8Array(n))].map(x => x.toString(16).padStart(2, '0')).join(''); }
+
+function toggleEdit() {
+  if (S.edit) { S.edit = false; render(); toast('편집을 마쳤어요.'); return; }
+  if (!S.model || !S.ready.meta) { toast('설정을 불러오는 중이에요. 잠시 후 다시 눌러주세요.'); return; }
+  if (S.model.settings.editHash) openEditPwSheet(); else openSetEditPwSheet(true);
+}
+
+function field(f) {
+  const id = `f_${f.name}`;
+  const v = f.value ?? '';
+  const help = f.help ? `<small>${esc(f.help)}</small>` : '';
+  let input;
+  if (f.type === 'textarea') input = `<textarea id="${id}" name="${f.name}" rows="${f.rows || 4}" placeholder="${esc(f.ph || '')}">${esc(v)}</textarea>`;
+  else if (f.type === 'select') input = `<select id="${id}" name="${f.name}">${f.options.map(([ov, ol]) => `<option value="${esc(ov)}" ${String(ov) === String(v) ? 'selected' : ''}>${esc(ol)}</option>`).join('')}</select>`;
+  else if (f.type === 'people') {
+    const sel = new Set(v || []);
+    input = `<div class="checks">${f.options.map(n => `<label class="check"><input type="checkbox" name="${f.name}" value="${esc(n)}" ${sel.has(n) ? 'checked' : ''}><span>${esc(n)}</span></label>`).join('')}</div>
+      <input id="${id}_extra" name="${f.name}_extra" type="text" placeholder="다른 사람 추가 (쉼표로 구분)">`;
+  } else input = `<input id="${id}" name="${f.name}" type="${f.type || 'text'}" value="${esc(v)}" placeholder="${esc(f.ph || '')}" ${f.inputmode ? `inputmode="${f.inputmode}"` : ''} ${f.autocomplete ? `autocomplete="${f.autocomplete}"` : ''}>`;
+  return `<div class="fg ${f.half ? 'half' : ''}"><label for="${id}">${esc(f.label)}${f.required ? ' <em>*</em>' : ''}</label>${input}${help}</div>`;
+}
+
+function openSheet({ title, fields, submit, danger, onSubmit, onDanger, note }) {
+  S.sheet = { onSubmit, onDanger };
+  $('sheetTitle').textContent = title;
+  $('sheetForm').innerHTML = `${note ? `<p class="sheet-note">${note}</p>` : ''}<div class="fields">${fields.map(field).join('')}</div>
+    <p class="form-err" id="formErr" role="alert"></p>
+    <div class="sheet-actions">${danger ? `<button type="button" class="btn danger" data-act="sheetDanger">${esc(danger)}</button>` : ''}<span class="spacer"></span>
+      <button type="button" class="btn" data-act="closeSheet">취소</button><button type="submit" class="btn primary">${esc(submit)}</button></div>`;
+  $('sheet').hidden = false;
+  document.body.classList.add('noscroll');
+  const first = $('sheetForm').querySelector('input:not([type=checkbox]),textarea,select');
+  if (first && fields.length <= 2) setTimeout(() => first.focus(), 50);
+}
+function closeSheet() {
+  $('sheet').hidden = true;
+  document.body.classList.remove('noscroll');
+  S.sheet = null;
+}
+const formErr = msg => { $('formErr').textContent = msg; };
+function formValues() {
+  const fd = new FormData($('sheetForm'));
+  const out = {};
+  for (const [k, v] of fd.entries()) {
+    if (k in out) out[k] = [].concat(out[k], v); else out[k] = typeof v === 'string' ? v.trim() : v;
+  }
+  return out;
+}
+
+function openEditPwSheet() {
+  openSheet({
+    title: '편집 비밀번호', submit: '편집 시작',
+    note: '실수로 고치는 걸 막기 위한 비밀번호예요.',
+    fields: [{ name: 'pw', label: '편집 비밀번호', type: 'password', autocomplete: 'off' }],
+    onSubmit: async v => {
+      const st = S.model.settings;
+      if ((await sha256hex(`${st.editSalt}:${v.pw}`)) !== st.editHash) { formErr('편집 비밀번호가 맞지 않아요.'); return; }
+      closeSheet(); S.edit = true; render();
+      toast('편집 모드예요. 카드를 펼치면 수정·삭제 버튼이 보여요.');
+    },
+  });
+}
+function openSetEditPwSheet(first) {
+  openSheet({
+    title: first ? '편집 비밀번호 정하기' : '편집 비밀번호 바꾸기', submit: '저장',
+    note: first ? '아직 편집 비밀번호가 없어요. 함께 편집할 분들과 나눌 비밀번호를 정해주세요.' : '새 편집 비밀번호를 넣어주세요. 함께 편집하는 분들께도 알려주세요.',
+    fields: [{ name: 'pw', label: '새 편집 비밀번호 (4자 이상)', type: 'password', autocomplete: 'new-password' }, { name: 'pw2', label: '한 번 더', type: 'password', autocomplete: 'new-password' }],
+    onSubmit: async v => {
+      if ((v.pw || '').length < 4) { formErr('4자 이상으로 정해주세요.'); return; }
+      if (v.pw !== v.pw2) { formErr('두 칸이 서로 달라요.'); return; }
+      const salt = randHex(16);
+      write('meta', 'settings', { editSalt: salt, editHash: await sha256hex(`${salt}:${v.pw}`) }, '편집 비밀번호를 저장했어요.');
+      S.edit = true; render();
+    },
+  });
+}
+
+function write(col, id, data, okMsg) {
+  const p = setDoc(doc(fb.db, col, id), { ...data, updatedAt: serverTimestamp() }, { merge: true });
+  closeSheet();
+  toast(navigator.onLine ? okMsg : `${okMsg} 인터넷이 연결되면 올라가요.`);
+  p.catch(err => toast(`저장하지 못했어요 (${err.code || err.message})`));
+}
+function remove(col, id, okMsg) {
+  const p = deleteDoc(doc(fb.db, col, id));
+  closeSheet();
+  toast(okMsg);
+  p.catch(err => toast(`삭제하지 못했어요 (${err.code || err.message})`));
+}
+
+const TYPE_OPTS = Object.entries(TYPE).map(([k, [l]]) => [k, `${l} (${k})`]);
+function openSessionSheet(id) {
+  const s = id ? S.model.sessions.find(x => x.id === id) : null;
+  if (id && !s) return;
+  const base = s || { date: S.day || S.model.meta.start, type: 'Seminar', track: 'General', attendees: [...S.model.people] };
+  openSheet({
+    title: s ? '일정 수정' : '일정 추가', submit: '저장', danger: s ? '삭제' : '',
+    fields: [
+      { name: 'title', label: '제목', required: true, value: base.title, ph: '예: [SEC203] 멀티클라우드 통합 보안' },
+      { name: 'date', label: '날짜', type: 'date', required: true, value: base.date, half: true },
+      { name: 'type', label: '종류', type: 'select', options: TYPE_OPTS, value: base.type, half: true },
+      { name: 'start', label: '시작', type: 'time', value: base.start, half: true },
+      { name: 'end', label: '끝', type: 'time', value: base.end, half: true },
+      { name: 'track', label: '트랙', type: 'select', options: [['General', 'General'], ['Security', 'Security']], value: base.track || 'General', half: true },
+      { name: 'location', label: '장소', value: base.location, ph: '예: Venetian L2 · Venetian Theatre' },
+      { name: 'attendees', label: '출장자', type: 'people', options: S.model.people, value: base.attendees },
+      { name: 'people', label: '연사·참고', value: base.people },
+      { name: 'note', label: '메모', type: 'textarea', rows: 6, value: base.note },
+    ],
+    onSubmit: v => {
+      if (!v.title) { formErr('제목을 넣어주세요.'); return; }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(v.date || '')) { formErr('날짜를 골라주세요.'); return; }
+      if (v.start && v.end && v.end < v.start) { formErr('끝 시간이 시작보다 빨라요.'); return; }
+      const attendees = [].concat(v.attendees || []);
+      for (const n of String(v.attendees_extra || '').split(',').map(x => x.trim()).filter(Boolean)) if (!attendees.includes(n)) attendees.push(n);
+      const docId = s ? s.id : `s-${Date.now()}`;
+      S.day = v.date; S.open.add(docId); S.query = '';
+      write('sessions', docId, { title: v.title, date: v.date, start: v.start || '', end: v.end || '', type: v.type, track: v.track, location: v.location || '', attendees, people: v.people || '', note: v.note || '' }, s ? '일정을 고쳤어요.' : '일정을 추가했어요.');
+      renderSchedule();
+    },
+    onDanger: () => { if (confirm('이 일정을 삭제할까요?')) remove('sessions', s.id, '일정을 삭제했어요.'); },
+  });
+}
+
+function openPlaceSheet(id) {
+  const p = id ? S.model.places.find(x => x.id === id) : null;
+  if (id && !p) return;
+  const base = p || { c: S.cat !== 'all' && S.cat !== 'etc' ? S.cat : 'steak' };
+  openSheet({
+    title: p ? '장소 수정' : '장소 추가', submit: '저장', danger: p ? '삭제' : '',
+    fields: [
+      { name: 'k', label: '이름 (한글)', value: base.k, ph: '예: 피터 루거', half: true },
+      { name: 'n', label: '이름 (영문)', value: base.n, ph: 'Peter Luger Steak House', half: true },
+      { name: 'c', label: '분류', type: 'select', options: CATS.map(c => [c[0], c[2]]), value: base.c, half: true },
+      { name: 'pr', label: '가격대', type: 'select', options: [['', '—'], ['$', '$'], ['$$', '$$'], ['$$$', '$$$'], ['$$$$', '$$$$']], value: base.pr, half: true },
+      { name: 'at', label: '행사 일시 (메가존 행사)', value: base.at, ph: '2026-12-03 18:00–21:00' },
+      { name: 't', label: '종류 설명', value: base.t, ph: '예: 브루클린식 스테이크하우스' },
+      { name: 'v', label: '위치', value: base.v, ph: '예: 시저스 팰리스' },
+      { name: 'h', label: '숙소 표시', type: 'select', options: [['', '—'], ['숙소 안', '숙소 안'], ['숙소', '숙소 (거리 계산 기준)']], value: base.h, half: true },
+      { name: 'memo', label: '메모 배지', value: base.memo, ph: '예: 조식 가능', half: true },
+      { name: 'd', label: '소개', type: 'textarea', rows: 3, value: base.d },
+      { name: 'x', label: '방문 팁', type: 'textarea', rows: 3, value: base.x },
+      { name: 'w', label: '공식 사이트', type: 'url', inputmode: 'url', value: base.w, ph: 'https://…' },
+      { name: 'map', label: '지도 링크', type: 'url', inputmode: 'url', value: base.map, ph: 'https://maps.app.goo.gl/…' },
+      { name: 'll', label: '좌표 (숙소와의 거리 계산)', value: Array.isArray(base.ll) ? base.ll.join(', ') : '', ph: '36.1133, -115.1750' },
+      { name: 'm', label: '일정 연결 단어', value: base.m, help: '일정 제목·장소에 이 단어가 있으면 서로 연결해 보여줘요.' },
+    ],
+    onSubmit: v => {
+      if (!v.k && !v.n) { formErr('이름을 넣어주세요.'); return; }
+      let ll = null;
+      if (v.ll) {
+        const m = /^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/.exec(v.ll);
+        if (!m) { formErr('좌표는 "36.1133, -115.1750"처럼 넣어주세요.'); return; }
+        ll = [+m[1], +m[2]];
+      }
+      if (v.h === '숙소') for (const o of S.model.places) if (o.h === '숙소' && o.id !== (p && p.id)) write('places', o.id, { h: '' }, '');
+      const docId = p ? p.id : `p-${Date.now()}`;
+      const data = { k: v.k || '', n: v.n || '', c: v.c, pr: v.pr || '', at: v.at || '', t: v.t || '', v: v.v || '', h: v.h || '', memo: v.memo || '', d: v.d || '', x: v.x || '', w: v.w || '', map: v.map || '', ll, m: v.m || '' };
+      S.open.add('p:' + docId); S.cat = data.c;
+      write('places', docId, data, p ? '장소를 고쳤어요.' : '장소를 추가했어요.');
+      renderPlaces();
+    },
+    onDanger: () => { if (confirm('이 장소를 삭제할까요?')) remove('places', p.id, '장소를 삭제했어요.'); },
+  });
+}
+
+function openTripSheet() {
+  const m = S.model.meta;
+  openSheet({
+    title: '여행 정보 수정', submit: '저장',
+    fields: [
+      { name: 'title', label: '이름', required: true, value: m.title },
+      { name: 'start', label: '시작일', type: 'date', value: m.start, half: true },
+      { name: 'end', label: '종료일', type: 'date', value: m.end, half: true },
+      { name: 'location', label: '장소', value: m.location },
+      { name: 'note', label: '메모', type: 'textarea', rows: 3, value: m.note },
+    ],
+    onSubmit: v => {
+      if (!v.title) { formErr('이름을 넣어주세요.'); return; }
+      if (v.start && v.end && v.end < v.start) { formErr('종료일이 시작일보다 빨라요.'); return; }
+      write('meta', 'trip', { title: v.title, start: v.start || '', end: v.end || '', location: v.location || '', note: v.note || '' }, '여행 정보를 고쳤어요.');
+    },
+  });
 }
 
 /* ---------- 이벤트 ---------- */
 let toastTimer;
 function toast(msg) {
+  if (!msg) return;
   const t = $('toast');
   t.textContent = msg; t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 3200);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 3400);
 }
 
 function setTab(tab) {
@@ -467,10 +670,21 @@ function setTab(tab) {
   window.scrollTo(0, 0);
 }
 
-document.addEventListener('click', async e => {
+async function forgetDevice() {
+  if (!confirm('이 기기에서 로그인 정보와 저장된 일정을 지울까요?')) return;
+  stopListeners();
+  try { await signOut(fb.auth); } catch { /* 무시 */ }
+  try { await terminate(fb.db); await clearIndexedDbPersistence(fb.db); } catch { /* 무시 */ }
+  Object.values(K).forEach(store.del);
+  location.reload();
+}
+
+document.addEventListener('click', e => {
   const tabBtn = e.target.closest('.tabs button');
   if (tabBtn) { setTab(tabBtn.dataset.tab); return; }
-  if (e.target.closest('#syncPill')) { sync(true); return; }
+  if (e.target.closest('#syncPill')) { checkServer(); return; }
+  if (e.target.closest('#editBtn')) { toggleEdit(); return; }
+  if (e.target.closest('#fab')) { if (S.tab === 'places') openPlaceSheet(); else openSessionSheet(); return; }
   const el = e.target.closest('[data-act]');
   if (!el) return;
   const v = el.dataset.v;
@@ -489,67 +703,69 @@ document.addEventListener('click', async e => {
       if (target) target.scrollIntoView({ block: 'center' });
       break;
     }
-    case 'sync': await sync(true); if (S.tab === 'info') renderInfo(); break;
-    case 'install':
-      if (S.installEvt) { S.installEvt.prompt(); S.installEvt = null; }
-      break;
-    case 'forget':
-      if (!confirm('이 기기에서 비밀번호와 저장된 일정을 지울까요?')) return;
-      for (const k of Object.values(K)) store.del(k);
-      S.data = null; S.key = null; S.model = null; S.enc = null;
-      showLock('지웠어요. 다시 쓰려면 비밀번호를 입력하세요.');
-      sync(false);
-      break;
+    case 'check': checkServer(); break;
+    case 'install': if (S.installEvt) { S.installEvt.prompt(); S.installEvt = null; } break;
+    case 'forget': forgetDevice(); break;
+    case 'editSession': openSessionSheet(v); break;
+    case 'delSession': if (confirm('이 일정을 삭제할까요?')) remove('sessions', v, '일정을 삭제했어요.'); break;
+    case 'editPlace': openPlaceSheet(v); break;
+    case 'delPlace': if (confirm('이 장소를 삭제할까요?')) remove('places', v, '장소를 삭제했어요.'); break;
+    case 'editTrip': openTripSheet(); break;
+    case 'setEditPw': openSetEditPwSheet(false); break;
+    case 'closeSheet': closeSheet(); break;
+    case 'sheetDanger': if (S.sheet && S.sheet.onDanger) S.sheet.onDanger(); break;
   }
 });
 
-document.addEventListener('input', e => {
-  if (e.target.id === 'q') { S.query = e.target.value; renderScheduleBody(); }
+$('sheetForm').addEventListener('submit', e => {
+  e.preventDefault();
+  if (S.sheet && S.sheet.onSubmit) S.sheet.onSubmit(formValues());
 });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('sheet').hidden) closeSheet(); });
+document.addEventListener('input', e => { if (e.target.id === 'q') { S.query = e.target.value; renderScheduleBody(); } });
 
 $('lockForm').addEventListener('submit', async e => {
   e.preventDefault();
+  if (!fb) return;
   const input = $('pin'), btn = $('unlockBtn'), msg = $('lockMsg');
-  if (!S.enc) { showLock(); return; }
-  btn.disabled = true; msg.className = 'lock-msg ok'; msg.textContent = '여는 중…';
+  btn.disabled = true; msg.className = 'lock-msg ok'; msg.textContent = '확인하는 중…';
   try {
-    const key = await deriveKey(input.value.trim(), S.enc.kdf);
-    let payload;
-    try { payload = await decryptWith(key, S.enc); } catch { throw new Error('pin'); }
-    S.key = key;
-    store.set(K.key, b64e(await crypto.subtle.exportKey('raw', key)));
-    store.set(K.keyId, kdfId(S.enc));
-    setData(payload);
+    await signInWithEmailAndPassword(fb.auth, VIEWER_EMAIL, viewerPassword(input.value.trim()));
     input.value = '';
-    showApp();
+    msg.textContent = '';
   } catch (err) {
+    const code = err && err.code;
     msg.className = 'lock-msg';
-    msg.textContent = err.message === 'pin' ? '비밀번호가 맞지 않아요.' : '이 브라우저에서는 열 수 없어요. 최신 Safari나 Chrome을 써주세요.';
+    msg.textContent = code === 'auth/network-request-failed' ? '처음 한 번은 인터넷 연결이 필요해요.'
+      : code === 'auth/too-many-requests' ? '시도가 너무 많아요. 잠시 후 다시 해주세요.'
+        : '비밀번호가 맞지 않아요.';
     input.select();
-  } finally { btn.disabled = !S.enc; }
+  } finally { btn.disabled = false; }
 });
 
-window.addEventListener('online', () => { S.online = true; sync(false); });
-window.addEventListener('offline', () => { S.online = false; renderHeader(); });
+window.addEventListener('online', () => { renderHeader(); if (fb) enableNetwork(fb.db).catch(() => {}); });
+window.addEventListener('offline', renderHeader);
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible' || !S.data) return;
-  const age = Date.now() - new Date(S.fetchedAt || 0).getTime();
-  if (age > 10 * 60 * 1000) sync(false);
-  else if (S.tab === 'schedule') renderScheduleBody(); // '진행 중' 표시 갱신
+  if (document.visibilityState === 'visible' && S.model && S.tab === 'schedule') renderScheduleBody(); // '진행 중' 표시 갱신
 });
-window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; if (S.tab === 'info' && S.data) renderInfo(); });
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; if (S.tab === 'info' && S.model) renderInfo(); });
 
 /* ---------- 시작 ---------- */
-async function boot() {
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
-  try { const c = store.get(K.enc); if (c) S.enc = JSON.parse(c); } catch { S.enc = null; }
-  if (S.enc && await tryStoredKey()) showApp(); else showLock();
-  await sync(false);
-  if (!S.data && $('lock').hidden === false) showLock();
-}
-
-if (!window.crypto || !crypto.subtle) {
-  document.body.innerHTML = '<p style="padding:32px;font-family:sans-serif">이 브라우저에서는 열 수 없어요. 최신 Safari나 Chrome으로 열어주세요.</p>';
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+if (!firebaseConfig) {
+  showLock();
 } else {
-  boot();
+  fb = initFirebase();
+  // 로그인 상태는 기기 저장소에서 바로 확인되므로, 확인 전에는 잠금 화면을 띄우지 않습니다.
+  onAuthStateChanged(fb.auth, user => {
+    if (user && user.email === VIEWER_EMAIL) {
+      S.user = user;
+      startListeners();
+      showApp();
+    } else {
+      S.user = null; S.edit = false;
+      stopListeners();
+      showLock();
+    }
+  });
 }

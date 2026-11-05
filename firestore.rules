@@ -1,0 +1,11 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isMember() {
+      return request.auth != null && request.auth.token.email == 'viewer@example.com';
+    }
+    match /{collection}/{docId} {
+      allow read, write: if isMember() && collection in ['sessions', 'places', 'meta'];
+    }
+  }
+}

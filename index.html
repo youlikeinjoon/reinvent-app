@@ -41,13 +41,21 @@
       <h1 id="tTitle">re:Invent 2026</h1>
       <p id="tSub"></p>
     </div>
-    <button id="syncPill" class="sync-pill" type="button" aria-label="지금 동기화">
-      <span class="dot" aria-hidden="true"></span><span id="syncText"></span>
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </button>
+    <div class="top-actions">
+      <button id="syncPill" class="sync-pill" type="button" aria-label="연결 상태 확인">
+        <span class="dot" aria-hidden="true"></span><span id="syncText"></span>
+      </button>
+      <button id="editBtn" class="edit-btn" type="button" aria-label="편집">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4zM13.5 6.5l4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/></svg>
+        <span id="editText">편집</span>
+      </button>
+    </div>
   </header>
+  <div id="editBar" class="edit-bar" hidden>편집 모드예요. 다 고쳤으면 위쪽 <b>완료</b>를 누르세요.</div>
 
   <main id="view" class="view"></main>
+
+  <button id="fab" class="fab" type="button" hidden></button>
 
   <nav class="tabs" aria-label="화면">
     <button type="button" data-tab="schedule">
@@ -65,8 +73,16 @@
   </nav>
 </div>
 
+<div id="sheet" class="sheet" hidden>
+  <div class="sheet-backdrop" data-act="closeSheet"></div>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+    <div class="sheet-head"><h2 id="sheetTitle"></h2><button type="button" class="sheet-x" data-act="closeSheet" aria-label="닫기">✕</button></div>
+    <form id="sheetForm" class="sheet-body" novalidate></form>
+  </div>
+</div>
+
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 <noscript><p style="padding:24px">이 앱은 JavaScript가 필요합니다.</p></noscript>
-<script src="app.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>
