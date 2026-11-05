@@ -5,14 +5,14 @@
 import {
   initializeApp, initializeAuth, indexedDBLocalPersistence, browserLocalPersistence, signInWithEmailAndPassword, signOut,
   onAuthStateChanged, connectAuthEmulator, initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
-  connectFirestoreEmulator, collection, doc, onSnapshot, setDoc, deleteDoc, serverTimestamp, getDocsFromServer,
+  connectFirestoreEmulator, collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, serverTimestamp, getDocsFromServer,
   terminate, clearIndexedDbPersistence, enableNetwork,
 } from './vendor/firebase.js';
 import { firebaseConfig, VIEWER_EMAIL, viewerPassword, emulator } from './firebase-config.js';
 
-const APP_VERSION = '2.2.0';
+const APP_VERSION = '2.3.0';
 const COLS = ['sessions', 'places', 'meta'];
-const K = { person: 'rv.person', tab: 'rv.tab', cat: 'rv.cat', lastSync: 'rv.lastSync' };
+const K = { person: 'rv.person', tab: 'rv.tab', cat: 'rv.cat', lastSync: 'rv.lastSync', outbox: 'rv.outbox' };
 const store = {
   get(k) { try { return localStorage.getItem(k); } catch { return null; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch { /* 저장 불가 환경 */ } },
@@ -26,6 +26,7 @@ const S = {
   tab: store.get(K.tab) || 'schedule', person: store.get(K.person) || '', cat: store.get(K.cat) || 'all',
   day: null, query: '', open: new Set(), edit: false, checking: false, installEvt: null,
   lastSync: store.get(K.lastSync), sheet: null,
+  outbox: [], conflicts: [], flushing: false,
 };
 let fb = null;
 let unsubs = [];
@@ -78,6 +79,7 @@ function onData() {
     store.set(K.lastSync, S.lastSync);
   }
   S.model = buildModel();
+  if (S.outbox.length && !isOffline()) flushOutbox();
   if (frame) return;
   frame = requestAnimationFrame(() => {
     frame = 0;
@@ -100,19 +102,34 @@ async function checkServer() {
     ]);
     S.lastSync = new Date().toISOString(); store.set(K.lastSync, S.lastSync);
     toast(S.pending ? `최신 상태예요. 올라가길 기다리는 변경 ${S.pending}건이 있어요.` : '최신 상태예요. 고친 내용은 자동으로 바로 반영돼요.');
+    flushOutbox();
   } catch {
     toast('서버에 연결하지 못했어요. 마지막 저장본을 보여드려요.');
   } finally { S.checking = false; renderHeader(); }
 }
 
 /* ---------- 데이터 정리 ---------- */
+// 아직 서버에 올리지 않은 오프라인 수정(대기 목록)을 화면용 데이터에 겹칩니다.
+function overlay(col) {
+  const out = S.raw[col].map(d => ({ ...d }));
+  for (const e of S.outbox) {
+    if (e.col !== col) continue;
+    const i = out.findIndex(d => d.id === e.id);
+    if (i < 0) continue;
+    if (e.op === 'delete') out.splice(i, 1);
+    else out[i] = { ...out[i], ...e.changes, _pending: true };
+  }
+  return out;
+}
+
 function buildModel() {
-  const metaDoc = S.raw.meta.find(d => d.id === 'trip');
-  const settings = S.raw.meta.find(d => d.id === 'settings') || {};
+  const metaList = overlay('meta');
+  const metaDoc = metaList.find(d => d.id === 'trip');
+  const settings = metaList.find(d => d.id === 'settings') || {};
   const meta = { title: 'AWS re:Invent 2026', start: '', end: '', location: '', note: '', mapUrl: '', ...(metaDoc || {}) };
-  const sessions = S.raw.sessions.map(d => ({ ...d, attendees: Array.isArray(d.attendees) ? d.attendees : [] }))
+  const sessions = overlay('sessions').map(d => ({ ...d, attendees: Array.isArray(d.attendees) ? d.attendees : [] }))
     .sort((a, b) => (a.date || '').localeCompare(b.date || '') || (a.start || '99').localeCompare(b.start || '99') || (a.title || '').localeCompare(b.title || ''));
-  const places = S.raw.places.map(d => ({ ...d }));
+  const places = overlay('places');
   const hotel = places.find(x => x.h === '숙소') || null;
   let people = [];
   const widest = sessions.reduce((m, s) => (s.attendees.length > (m ? m.attendees.length : 0) ? s : m), null);
@@ -236,9 +253,11 @@ function renderHeader() {
   const allReady = COLS.every(c => S.ready[c]);
   const cached = COLS.some(c => S.fromCache[c]);
   let text, warn = false;
+  const waiting = S.pending + S.outbox.length;
   if (S.checking) text = '확인 중';
-  else if (!navigator.onLine) { text = `오프라인 ${stamp(S.lastSync)}`.trim(); warn = true; }
-  else if (S.pending) { text = `대기 ${S.pending}건`; warn = true; }
+  else if (S.conflicts.length) { text = `확인 필요 ${S.conflicts.length}건`; warn = true; }
+  else if (!navigator.onLine) { text = waiting ? `오프라인 · 대기 ${waiting}건` : `오프라인 ${stamp(S.lastSync)}`.trim(); warn = true; }
+  else if (waiting) { text = `대기 ${waiting}건`; warn = true; }
   else if (!allReady || cached) { text = '연결 중'; warn = true; }
   else text = '실시간';
   $('syncText').textContent = text;
@@ -513,7 +532,9 @@ function renderInfo() {
         <dt>상태</dt><dd>${esc({ '실시간': '실시간 연결됨' }[$('syncText').textContent] || $('syncText').textContent)}</dd>
         <dt>마지막으로 서버와 맞춘 시각</dt><dd>${esc(stamp(S.lastSync) || '—')}</dd>
       </dl>
-      <p class="muted">누군가 고치면 몇 초 안에 모두의 화면에 반영돼요. 인터넷이 끊기면 마지막 저장본을 보여주고, 그동안 고친 내용은 연결되면 자동으로 올라가요.</p>
+      <p class="muted">누군가 고치면 몇 초 안에 모두의 화면에 반영돼요. 저장할 때는 바꾼 칸만 올라가서, 다른 사람이 다른 칸을 고친 건 지워지지 않아요.</p>
+      <p class="muted">인터넷이 끊기면 마지막 저장본을 보여줘요. 그동안 고친 내용은 이 기기에 보관했다가, 연결되면 다른 사람 수정과 비교해서 올려요. 같은 칸을 다른 사람이 먼저 고쳤으면 어느 쪽으로 할지 물어봐요.</p>
+      ${S.outbox.length ? `<p class="muted"><b>올라가길 기다리는 오프라인 수정 ${S.outbox.length}건</b></p>` : ''}
       <div class="actions"><button class="btn green" type="button" data-act="check" ${S.checking ? 'disabled' : ''}>지금 확인</button></div>
     </div>
     <div class="panel">
@@ -557,12 +578,12 @@ function field(f) {
   return `<div class="fg ${f.half ? 'half' : ''}"><label for="${id}">${esc(f.label)}${f.required ? ' <em>*</em>' : ''}</label>${input}${help}</div>`;
 }
 
-function openSheet({ title, fields = [], html = '', submit, danger, onSubmit, onDanger, note, noCancel }) {
+function openSheet({ title, fields = [], html = '', submit, danger, dangerPlain, onSubmit, onDanger, note, noCancel }) {
   S.sheet = { onSubmit, onDanger };
   $('sheetTitle').textContent = title;
   $('sheetForm').innerHTML = `${note ? `<p class="sheet-note">${note}</p>` : ''}${html}${fields.length ? `<div class="fields">${fields.map(field).join('')}</div>` : ''}
     <p class="form-err" id="formErr" role="alert"></p>
-    <div class="sheet-actions">${danger ? `<button type="button" class="btn danger" data-act="sheetDanger">${esc(danger)}</button>` : ''}<span class="spacer"></span>
+    <div class="sheet-actions">${danger ? `<button type="button" class="btn ${dangerPlain ? '' : 'danger'}" data-act="sheetDanger">${esc(danger)}</button>` : ''}<span class="spacer"></span>
       ${noCancel ? '' : '<button type="button" class="btn" data-act="closeSheet">취소</button>'}<button type="submit" class="btn primary">${esc(submit)}</button></div>`;
   $('sheet').hidden = false;
   document.body.classList.add('noscroll');
@@ -606,23 +627,182 @@ function openSetEditPwSheet(first) {
       if ((v.pw || '').length < 4) { formErr('4자 이상으로 정해주세요.'); return; }
       if (v.pw !== v.pw2) { formErr('두 칸이 서로 달라요.'); return; }
       const salt = randHex(16);
-      write('meta', 'settings', { editSalt: salt, editHash: await sha256hex(`${salt}:${v.pw}`) }, '편집 비밀번호를 저장했어요.');
+      setDirect('meta', 'settings', { editSalt: salt, editHash: await sha256hex(`${salt}:${v.pw}`) }, '편집 비밀번호를 저장했어요.');
       S.edit = true; render();
     },
   });
 }
 
-function write(col, id, data, okMsg) {
+/* ---------- 저장: 바꾼 칸만 · 오프라인 대기 목록 · 충돌 확인 ---------- */
+const FIELD_LABEL = {
+  title: '제목', date: '날짜', start: '시작', end: '끝', type: '종류', track: '트랙', location: '장소', attendees: '출장자', people: '연사·참고', note: '메모',
+  k: '이름(한글)', n: '이름(영문)', c: '분류', pr: '가격대', at: '행사 일시', t: '종류 설명', v: '위치', h: '숙소 표시', memo: '메모 배지',
+  d: '소개', x: '방문 팁', w: '공식 사이트', map: '지도 링크', ll: '좌표', m: '일정 연결 단어', mapUrl: '구글 공유맵 링크', cid: '지도 ID',
+};
+const blank = v => v == null || v === '' || (Array.isArray(v) && !v.length);
+const same = (a, b) => (blank(a) && blank(b)) || JSON.stringify(a) === JSON.stringify(b);
+const sameSet = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every(x => b.includes(x));
+const pick = (o, keys) => Object.fromEntries(keys.map(k => [k, o[k]]));
+const fieldsOf = d => Object.fromEntries(Object.entries(d || {}).filter(([k]) => !['id', '_pending', 'updatedAt'].includes(k)));
+const diffFields = (a, b) => [...new Set([...Object.keys(a || {}), ...Object.keys(b || {})])].filter(k => !same((a || {})[k], (b || {})[k]));
+const rawDoc = (col, id) => S.raw[col].find(d => d.id === id) || null;
+// 서버와 실시간으로 연결돼 있지 않으면 오프라인으로 봅니다.
+const isOffline = () => !navigator.onLine || !COLS.every(c => S.ready[c] && !S.fromCache[c]);
+const warnErr = err => toast(err && err.code === 'not-found' ? '다른 사람이 삭제한 항목이라 저장하지 못했어요.' : `저장하지 못했어요 (${(err && (err.code || err.message)) || '알 수 없음'})`);
+
+function loadOutbox() { try { const v = JSON.parse(store.get(K.outbox) || '[]'); return Array.isArray(v) ? v : []; } catch { return []; } }
+function saveOutbox() { if (S.outbox.length) store.set(K.outbox, JSON.stringify(S.outbox)); else store.del(K.outbox); }
+function dropEntry(e) { S.outbox = S.outbox.filter(x => x !== e); }
+function refreshModel() { if (S.model) { S.model = buildModel(); render(); } }
+
+// 새 항목·설정: 겹칠 일이 없으므로 Firebase가 바로 저장합니다(오프라인이면 Firebase가 보관했다가 올림).
+function setDirect(col, id, data, okMsg) {
   const p = setDoc(doc(fb.db, col, id), { ...data, updatedAt: serverTimestamp() }, { merge: true });
   closeSheet();
-  toast(navigator.onLine ? okMsg : `${okMsg} 인터넷이 연결되면 올라가요.`);
-  p.catch(err => toast(`저장하지 못했어요 (${err.code || err.message})`));
+  if (okMsg) toast(isOffline() ? `${okMsg} 인터넷이 연결되면 올라가요.` : okMsg);
+  p.catch(warnErr);
 }
-function remove(col, id, okMsg) {
-  const p = deleteDoc(doc(fb.db, col, id));
+
+// 기존 항목 수정: 바꾼 칸만 저장합니다. 오프라인이면 대기 목록에 넣습니다.
+function commitChanges(col, id, changes) {
+  if (!Object.keys(changes).length) return 'none';
+  if (isOffline() || S.outbox.some(e => e.col === col && e.id === id)) {
+    queueUpdate(col, id, changes);
+    if (!isOffline()) flushOutbox();
+    return 'queued';
+  }
+  updateDoc(doc(fb.db, col, id), { ...changes, updatedAt: serverTimestamp() }).catch(warnErr);
+  return 'sent';
+}
+function saveEdit(col, id, next, orig, okMsg) {
+  const changes = {};
+  for (const [f, v] of Object.entries(next)) if (!same(v, orig[f])) changes[f] = v;
   closeSheet();
-  toast(okMsg);
-  p.catch(err => toast(`삭제하지 못했어요 (${err.code || err.message})`));
+  const r = commitChanges(col, id, changes);
+  if (r === 'none') toast('바뀐 내용이 없어요.');
+  else toast(r === 'queued' ? `${okMsg} 인터넷이 연결되면 다른 사람 수정과 비교해서 올려요.` : okMsg);
+  refreshModel();
+}
+function queueUpdate(col, id, changes) {
+  const server = rawDoc(col, id);
+  let e = S.outbox.find(x => x.col === col && x.id === id);
+  if (e && e.op === 'delete') return;
+  if (!e) { e = { col, id, op: 'update', changes: {}, base: {}, snapshot: fieldsOf(server), at: Date.now() }; S.outbox.push(e); }
+  for (const [f, v] of Object.entries(changes)) {
+    if (!(f in e.base)) e.base[f] = server && server[f] !== undefined ? server[f] : null;
+    e.changes[f] = v;
+    if (same(e.changes[f], e.base[f])) { delete e.changes[f]; delete e.base[f]; }
+  }
+  if (!Object.keys(e.changes).length) dropEntry(e);
+  saveOutbox();
+}
+
+function removeDoc(col, id, okMsg) {
+  closeSheet();
+  const local = rawDoc(col, id);
+  const prev = S.outbox.find(x => x.col === col && x.id === id);
+  if (isOffline() && local && !local._pending) {
+    const snapshot = prev ? prev.snapshot : fieldsOf(local);
+    if (prev) dropEntry(prev);
+    S.outbox.push({ col, id, op: 'delete', snapshot, at: Date.now() });
+    saveOutbox();
+    toast(`${okMsg} 인터넷이 연결되면 다른 사람 수정과 비교해서 반영해요.`);
+  } else {
+    if (prev) { dropEntry(prev); saveOutbox(); }
+    deleteDoc(doc(fb.db, col, id)).catch(warnErr);
+    toast(okMsg);
+  }
+  refreshModel();
+}
+
+// 다시 연결되면 대기 목록을 서버 최신 내용과 비교해서 올립니다.
+function flushOutbox() {
+  if (S.flushing || S.conflicts.length || !S.outbox.length || isOffline()) return;
+  S.flushing = true;
+  let applied = 0;
+  const conflicts = [];
+  for (const e of [...S.outbox]) {
+    const cur = rawDoc(e.col, e.id);
+    const ref = doc(fb.db, e.col, e.id);
+    if (e.op === 'delete') {
+      if (!cur) { dropEntry(e); continue; }
+      const changed = diffFields(e.snapshot, fieldsOf(cur));
+      if (!changed.length) { deleteDoc(ref).catch(warnErr); dropEntry(e); applied++; } else conflicts.push({ e, kind: 'edited', fields: changed });
+      continue;
+    }
+    if (!cur) { conflicts.push({ e, kind: 'deleted' }); continue; }
+    const keys = Object.keys(e.changes);
+    const clash = keys.filter(f => !same(cur[f], e.base[f]) && !same(cur[f], e.changes[f]));
+    const ok = keys.filter(f => !clash.includes(f));
+    if (ok.length) { updateDoc(ref, { ...pick(e.changes, ok), updatedAt: serverTimestamp() }).catch(warnErr); applied++; }
+    if (clash.length) { e.changes = pick(e.changes, clash); e.base = pick(e.base, clash); conflicts.push({ e, kind: 'clash', fields: clash }); } else dropEntry(e);
+  }
+  saveOutbox();
+  S.conflicts = conflicts;
+  S.flushing = false;
+  if (applied || conflicts.length) refreshModel();
+  if (applied) toast(`오프라인에서 고친 ${applied}건을 올렸어요.${conflicts.length ? ` 확인이 필요한 ${conflicts.length}건이 있어요.` : ''}`);
+  if (conflicts.length) setTimeout(showConflict, applied ? 900 : 0);
+}
+
+function docName(e) {
+  const d = e.snapshot || {};
+  if (e.col === 'meta') return '여행 정보';
+  return d.title || d.k || d.n || (e.changes && (e.changes.title || e.changes.k || e.changes.n)) || e.id;
+}
+function fmtVal(f, v) {
+  if (blank(v)) return '<i>(비어 있음)</i>';
+  const t = Array.isArray(v) ? v.join(f === 'll' ? ', ' : ' · ') : String(v);
+  return esc(t.length > 120 ? `${t.slice(0, 120)}…` : t);
+}
+function diffTable(fields, left, right, leftLabel, rightLabel) {
+  return `<table class="diff"><thead><tr><th></th><th>${leftLabel}</th><th>${rightLabel}</th></tr></thead><tbody>${fields.map(f => `<tr><th>${esc(FIELD_LABEL[f] || f)}</th><td>${fmtVal(f, left[f])}</td><td>${fmtVal(f, right[f])}</td></tr>`).join('')}</tbody></table>`;
+}
+
+function showConflict() {
+  const c = S.conflicts[0];
+  renderHeader();
+  if (!c) return;
+  const { e } = c;
+  const cur = fieldsOf(rawDoc(e.col, e.id));
+  const name = `<b>${esc(docName(e))}</b>`;
+  const more = S.conflicts.length > 1 ? `<p class="sheet-note">확인할 항목이 ${S.conflicts.length}건 있어요. 하나씩 물어볼게요.</p>` : '';
+  if (c.kind === 'clash') {
+    openSheet({
+      title: '다른 사람이 먼저 고쳤어요', submit: '내 수정으로 바꾸기', danger: '지금 내용 유지', dangerPlain: true, noCancel: true,
+      html: `<p class="sheet-note">${name} 항목을 오프라인에서 고치는 사이, 다른 사람이 같은 칸을 고쳤어요. 겹치지 않는 칸의 수정은 이미 올렸어요.</p>${diffTable(c.fields, e.changes, cur, '내 수정', '지금 내용')}${more}`,
+      onSubmit: () => resolveConflict(true), onDanger: () => resolveConflict(false),
+    });
+  } else if (c.kind === 'deleted') {
+    openSheet({
+      title: '다른 사람이 삭제한 항목이에요', submit: '내 수정으로 다시 만들기', danger: '삭제된 대로 두기', dangerPlain: true, noCancel: true,
+      html: `<p class="sheet-note">${name} 항목을 오프라인에서 고치는 사이, 다른 사람이 이 항목을 삭제했어요.</p>${diffTable(Object.keys(e.changes), e.changes, e.snapshot || {}, '내 수정', '삭제 전 내용')}${more}`,
+      onSubmit: () => resolveConflict(true), onDanger: () => resolveConflict(false),
+    });
+  } else {
+    openSheet({
+      title: '다른 사람이 고친 항목이에요', submit: '남겨두기', danger: '그래도 삭제', noCancel: true,
+      html: `<p class="sheet-note">${name} 항목을 오프라인에서 삭제했는데, 그사이 다른 사람이 이 항목을 고쳤어요.</p>${diffTable(c.fields, e.snapshot || {}, cur, '내가 본 내용', '지금 내용')}${more}`,
+      onSubmit: () => resolveConflict(false), onDanger: () => resolveConflict(true),
+    });
+  }
+}
+function resolveConflict(useMine) {
+  const c = S.conflicts.shift();
+  if (!c) return;
+  const { e } = c;
+  const ref = doc(fb.db, e.col, e.id);
+  let msg = '지금 내용을 그대로 뒀어요.';
+  if (c.kind === 'clash' && useMine) { updateDoc(ref, { ...e.changes, updatedAt: serverTimestamp() }).catch(warnErr); msg = '내 수정으로 바꿨어요.'; }
+  if (c.kind === 'deleted') {
+    if (useMine) { setDoc(ref, { ...(e.snapshot || {}), ...e.changes, updatedAt: serverTimestamp() }).catch(warnErr); msg = '내 수정으로 다시 만들었어요.'; } else msg = '삭제된 대로 뒀어요.';
+  }
+  if (c.kind === 'edited') { if (useMine) { deleteDoc(ref).catch(warnErr); msg = '삭제했어요.'; } else msg = '삭제하지 않고 남겨뒀어요.'; }
+  dropEntry(e); saveOutbox();
+  closeSheet();
+  toast(msg);
+  refreshModel();
+  if (S.conflicts.length) setTimeout(showConflict, 300); else flushOutbox();
 }
 
 const TYPE_OPTS = Object.entries(TYPE).map(([k, [l]]) => [k, `${l} (${k})`]);
@@ -648,14 +828,16 @@ function openSessionSheet(id) {
       if (!v.title) { formErr('제목을 넣어주세요.'); return; }
       if (!/^\d{4}-\d{2}-\d{2}$/.test(v.date || '')) { formErr('날짜를 골라주세요.'); return; }
       if (v.start && v.end && v.end < v.start) { formErr('끝 시간이 시작보다 빨라요.'); return; }
-      const attendees = [].concat(v.attendees || []);
+      let attendees = [].concat(v.attendees || []);
       for (const n of String(v.attendees_extra || '').split(',').map(x => x.trim()).filter(Boolean)) if (!attendees.includes(n)) attendees.push(n);
+      if (s && sameSet(attendees, s.attendees)) attendees = s.attendees; // 순서만 다른 건 바뀐 걸로 치지 않음
       const docId = s ? s.id : `s-${Date.now()}`;
+      const data = { title: v.title, date: v.date, start: v.start || '', end: v.end || '', type: v.type, track: v.track, location: v.location || '', attendees, people: v.people || '', note: v.note || '' };
       S.day = v.date; S.open.add(docId); S.query = '';
-      write('sessions', docId, { title: v.title, date: v.date, start: v.start || '', end: v.end || '', type: v.type, track: v.track, location: v.location || '', attendees, people: v.people || '', note: v.note || '' }, s ? '일정을 고쳤어요.' : '일정을 추가했어요.');
+      if (s) saveEdit('sessions', docId, data, s, '일정을 고쳤어요.'); else setDirect('sessions', docId, data, '일정을 추가했어요.');
       renderSchedule();
     },
-    onDanger: () => { if (confirm('이 일정을 삭제할까요?')) remove('sessions', s.id, '일정을 삭제했어요.'); },
+    onDanger: () => { if (confirm('이 일정을 삭제할까요?')) removeDoc('sessions', s.id, '일정을 삭제했어요.'); },
   });
 }
 
@@ -690,14 +872,14 @@ function openPlaceSheet(id) {
         if (!m) { formErr('좌표는 "36.1133, -115.1750"처럼 넣어주세요.'); return; }
         ll = [+m[1], +m[2]];
       }
-      if (v.h === '숙소') for (const o of S.model.places) if (o.h === '숙소' && o.id !== (p && p.id)) write('places', o.id, { h: '' }, '');
+      if (v.h === '숙소' && (!p || p.h !== '숙소')) for (const o of S.model.places) if (o.h === '숙소' && o.id !== (p && p.id)) commitChanges('places', o.id, { h: '' });
       const docId = p ? p.id : `p-${Date.now()}`;
       const data = { k: v.k || '', n: v.n || '', c: v.c, pr: v.pr || '', at: v.at || '', t: v.t || '', v: v.v || '', h: v.h || '', memo: v.memo || '', d: v.d || '', x: v.x || '', w: v.w || '', map: v.map || '', ll, m: v.m || '' };
       S.open.add('p:' + docId); S.cat = data.c;
-      write('places', docId, data, p ? '장소를 고쳤어요.' : '장소를 추가했어요.');
+      if (p) saveEdit('places', docId, data, p, '장소를 고쳤어요.'); else setDirect('places', docId, data, '장소를 추가했어요.');
       renderPlaces();
     },
-    onDanger: () => { if (confirm('이 장소를 삭제할까요?')) remove('places', p.id, '장소를 삭제했어요.'); },
+    onDanger: () => { if (confirm('이 장소를 삭제할까요?')) removeDoc('places', p.id, '장소를 삭제했어요.'); },
   });
 }
 
@@ -717,7 +899,8 @@ function openTripSheet() {
       if (!v.title) { formErr('이름을 넣어주세요.'); return; }
       if (v.start && v.end && v.end < v.start) { formErr('종료일이 시작일보다 빨라요.'); return; }
       if (v.mapUrl && !safeUrl(v.mapUrl)) { formErr('공유맵 링크는 https://로 시작해야 해요.'); return; }
-      write('meta', 'trip', { title: v.title, start: v.start || '', end: v.end || '', location: v.location || '', mapUrl: v.mapUrl || '', note: v.note || '' }, '여행 정보를 고쳤어요.');
+      const data = { title: v.title, start: v.start || '', end: v.end || '', location: v.location || '', mapUrl: v.mapUrl || '', note: v.note || '' };
+      if (rawDoc('meta', 'trip')) saveEdit('meta', 'trip', data, m, '여행 정보를 고쳤어요.'); else setDirect('meta', 'trip', data, '여행 정보를 저장했어요.');
     },
   });
 }
@@ -739,7 +922,7 @@ function setTab(tab) {
 }
 
 async function forgetDevice() {
-  if (!confirm('이 기기에서 로그인 정보와 저장된 일정을 지울까요?')) return;
+  if (!confirm(S.outbox.length ? `아직 올라가지 않은 오프라인 수정 ${S.outbox.length}건도 함께 사라져요. 이 기기에서 지울까요?` : '이 기기에서 로그인 정보와 저장된 일정을 지울까요?')) return;
   stopListeners();
   try { await signOut(fb.auth); } catch { /* 무시 */ }
   try { await terminate(fb.db); await clearIndexedDbPersistence(fb.db); } catch { /* 무시 */ }
@@ -750,7 +933,7 @@ async function forgetDevice() {
 document.addEventListener('click', e => {
   const tabBtn = e.target.closest('.tabs button');
   if (tabBtn) { setTab(tabBtn.dataset.tab); return; }
-  if (e.target.closest('#syncPill')) { checkServer(); return; }
+  if (e.target.closest('#syncPill')) { if (S.conflicts.length) showConflict(); else checkServer(); return; }
   if (e.target.closest('#editBtn')) { toggleEdit(); return; }
   if (e.target.closest('#fab')) { if (S.tab === 'places') openPlaceSheet(); else openSessionSheet(); return; }
   const el = e.target.closest('[data-act]');
@@ -779,9 +962,9 @@ document.addEventListener('click', e => {
       break;
     case 'forget': forgetDevice(); break;
     case 'editSession': openSessionSheet(v); break;
-    case 'delSession': if (confirm('이 일정을 삭제할까요?')) remove('sessions', v, '일정을 삭제했어요.'); break;
+    case 'delSession': if (confirm('이 일정을 삭제할까요?')) removeDoc('sessions', v, '일정을 삭제했어요.'); break;
     case 'editPlace': openPlaceSheet(v); break;
-    case 'delPlace': if (confirm('이 장소를 삭제할까요?')) remove('places', v, '장소를 삭제했어요.'); break;
+    case 'delPlace': if (confirm('이 장소를 삭제할까요?')) removeDoc('places', v, '장소를 삭제했어요.'); break;
     case 'editTrip': openTripSheet(); break;
     case 'setEditPw': openSetEditPwSheet(false); break;
     case 'closeSheet': closeSheet(); break;
@@ -833,6 +1016,7 @@ if (!firebaseConfig) {
   onAuthStateChanged(fb.auth, user => {
     if (user && user.email === VIEWER_EMAIL) {
       S.user = user;
+      S.outbox = loadOutbox();
       startListeners();
       showApp();
     } else {
