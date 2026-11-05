@@ -10,7 +10,7 @@ import {
 } from './vendor/firebase.js';
 import { firebaseConfig, VIEWER_EMAIL, viewerPassword, emulator } from './firebase-config.js';
 
-const APP_VERSION = '2.3.0';
+const APP_VERSION = '2.4.0';
 const COLS = ['sessions', 'places', 'meta'];
 const K = { person: 'rv.person', tab: 'rv.tab', cat: 'rv.cat', lastSync: 'rv.lastSync', outbox: 'rv.outbox' };
 const store = {
@@ -26,7 +26,7 @@ const S = {
   tab: store.get(K.tab) || 'schedule', person: store.get(K.person) || '', cat: store.get(K.cat) || 'all',
   day: null, query: '', open: new Set(), edit: false, checking: false, installEvt: null,
   lastSync: store.get(K.lastSync), sheet: null,
-  outbox: [], conflicts: [], flushing: false,
+  outbox: [], conflicts: [], flushing: false, autoDate: null,
 };
 let fb = null;
 let unsubs = [];
@@ -83,7 +83,7 @@ function onData() {
   if (frame) return;
   frame = requestAnimationFrame(() => {
     frame = 0;
-    if (!S.day && S.model.days.length) S.day = defaultDay();
+    if (!S.day && COLS.every(c => S.ready[c]) && S.model.days.length) S.day = defaultDay(); // 여행 정보까지 다 받은 뒤 정함
     renderHeader();
     if (S.tab === 'schedule' && $('schedBody')) renderScheduleBody();
     else render();
@@ -149,8 +149,20 @@ function addDays(s, n) { const p = ymd(s); const t = new Date(Date.UTC(p.y, p.m 
 const md = s => { const p = ymd(s); return `${p.m}/${p.d}`; };
 const wd = s => WD[ymd(s).wd];
 const dayLabel = s => `${md(s)} (${wd(s)})`;
-function todayStr() { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
-const nowMin = () => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); };
+// '오늘'과 '지금'은 폰 시계가 아니라 일정 기준 시간대(라스베이거스)로 계산합니다.
+const TRIP_TZ = 'America/Los_Angeles';
+function tripNow() {
+  const d = new Date();
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', { timeZone: (S.model && S.model.meta.tz) || TRIP_TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(d);
+    const g = t => (parts.find(x => x.type === t) || {}).value;
+    return { date: `${g('year')}-${g('month')}-${g('day')}`, min: (+g('hour') % 24) * 60 + +g('minute') };
+  } catch {
+    return { date: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`, min: d.getHours() * 60 + d.getMinutes() };
+  }
+}
+const todayStr = () => tripNow().date;
+const nowMin = () => tripNow().min;
 const toMin = t => { const m = /^(\d{1,2}):(\d{2})/.exec(t || ''); return m ? +m[1] * 60 + +m[2] : null; };
 function stamp(iso) {
   if (!iso) return '';
@@ -219,8 +231,10 @@ function showApp() {
   $('app').hidden = false;
   render();
 }
+// 오늘(라스베이거스 날짜)이 일정 기간 안이면 오늘, 시작 전이면 첫날, 끝난 뒤면 마지막 날
 function defaultDay() {
   const days = S.model.days, t = todayStr();
+  S.autoDate = t;
   if (days.includes(t)) return t;
   if (days.length && t > days[days.length - 1]) return days[days.length - 1];
   return days[0] || t;
@@ -313,7 +327,7 @@ function renderScheduleBody() {
   const items = list.filter(s => s.date === S.day);
   box.innerHTML = `
     <div class="days" id="days">${days}</div>
-    <p class="hint">시간은 모두 라스베이거스 현지 시간이에요. 카드를 누르면 자세한 내용이 보여요.</p>
+    <p class="hint">시간과 '오늘'은 모두 라스베이거스 현지 기준이에요. 카드를 누르면 자세한 내용이 보여요.</p>
     ${items.length ? `<ol class="cards">${items.map(s => sessionCard(s, S.day)).join('')}</ol>` : '<p class="empty">이 날은 등록된 일정이 없어요.</p>'}`;
   const active = box.querySelector('.day.active');
   if (active) active.scrollIntoView({ inline: 'center', block: 'nearest' });
@@ -1000,9 +1014,14 @@ $('lockForm').addEventListener('submit', async e => {
 
 window.addEventListener('online', () => { renderHeader(); if (fb) enableNetwork(fb.db).catch(() => {}); });
 window.addEventListener('offline', renderHeader);
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && S.model && S.tab === 'schedule') renderScheduleBody(); // '진행 중' 표시 갱신
-});
+// 앱을 다시 띄웠을 때나 1분마다: 날짜가 바뀌었으면 오늘 일정으로 옮기고 '진행 중' 표시를 갱신합니다.
+function refreshToday() {
+  if (document.visibilityState !== 'visible' || !S.model || !S.model.days.length) return;
+  if (S.autoDate && S.autoDate !== todayStr()) S.day = defaultDay();
+  if (S.tab === 'schedule' && $('schedBody') && !S.query) renderScheduleBody();
+}
+document.addEventListener('visibilitychange', refreshToday);
+setInterval(refreshToday, 60 * 1000);
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; refreshInstallUi(); });
 window.addEventListener('appinstalled', () => { S.installEvt = null; toast('홈 화면에 추가했어요.'); refreshInstallUi(); });
 

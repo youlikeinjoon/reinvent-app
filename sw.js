@@ -1,6 +1,6 @@
 // 앱 화면 파일을 기기에 저장해 두고, 인터넷이 없어도 앱이 열리게 합니다.
 // 일정 데이터는 Firebase가 기기에 따로 저장하므로(다른 주소) 여기서는 건드리지 않습니다.
-const CACHE = 'rv-shell-v5';
+const CACHE = 'rv-shell-v6';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './firebase-config.js', './vendor/firebase.js',
   './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 
