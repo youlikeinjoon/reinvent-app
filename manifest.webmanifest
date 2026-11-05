@@ -1,0 +1,16 @@
+{
+  "name": "re:Invent 2026 출장 일정",
+  "short_name": "re:Invent",
+  "description": "re:Invent 2026 출장 일정·장소 안내",
+  "lang": "ko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0b0c0c",
+  "theme_color": "#0b0c0c",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
