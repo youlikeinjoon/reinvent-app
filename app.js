@@ -10,7 +10,7 @@ import {
 } from './vendor/firebase.js';
 import { firebaseConfig, VIEWER_EMAIL, viewerPassword, emulator } from './firebase-config.js';
 
-const APP_VERSION = '2.1.0';
+const APP_VERSION = '2.2.0';
 const COLS = ['sessions', 'places', 'meta'];
 const K = { person: 'rv.person', tab: 'rv.tab', cat: 'rv.cat', lastSync: 'rv.lastSync' };
 const store = {
@@ -195,7 +195,7 @@ function showLock(msg) {
   const m = $('lockMsg');
   if (!fb) { m.textContent = '앱 설정이 아직 끝나지 않았어요.'; m.className = 'lock-msg ok'; $('unlockBtn').disabled = true; }
   else { m.textContent = msg || ''; m.className = 'lock-msg'; $('unlockBtn').disabled = false; }
-  $('lockInstall').innerHTML = installHtml(true);
+  $('lockInstall').innerHTML = installHtml();
 }
 function showApp() {
   $('lock').hidden = true;
@@ -409,19 +409,82 @@ function placeCard(p) {
 }
 
 /* ---------- 정보 ---------- */
+const UA = navigator.userAgent;
 const isStandalone = () => window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
-const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isIOS = () => /iPad|iPhone|iPod/.test(UA) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const appUrl = () => location.origin + location.pathname;
 
-function installHtml(onLock) {
-  if (isStandalone()) return '';
-  if (isIOS()) {
-    return `<div class="install ${onLock ? '' : 'panel'}"><h3>홈 화면에 앱으로 설치하기</h3>
-      <ol><li>Safari 아래쪽 <b>공유 버튼</b>(네모에 위쪽 화살표)을 누르세요.</li><li><b>홈 화면에 추가</b> → <b>추가</b>를 누르세요.</li><li>홈 화면의 <b>re:Invent</b> 아이콘으로 여세요.</li></ol>
-      <p style="margin-top:8px">아이콘으로 처음 열 때 비밀번호를 한 번 더 물을 수 있어요.</p></div>`;
+// 지금 브라우저에서 홈 화면에 추가하는 방법의 종류
+function installKind() {
+  if (isStandalone()) return 'installed';
+  if (/KAKAOTALK|NAVER\(inapp|Line\/|Instagram|FBAN|FBAV|DaumApps/i.test(UA)) return 'inapp';
+  if (S.installEvt) return 'prompt';
+  if (isIOS()) return /CriOS/.test(UA) ? 'ios-chrome' : /FxiOS|EdgiOS/.test(UA) ? 'ios-other' : 'ios-safari';
+  if (/SamsungBrowser/.test(UA)) return 'samsung';
+  if (/Android/.test(UA)) return 'android';
+  return 'desktop';
+}
+
+const SHARE = '<b>공유 버튼</b>(네모에 위쪽 화살표)';
+const INSTALL_STEPS = {
+  'ios-safari': [`화면 아래쪽 ${SHARE}을 누르세요. 안 보이면 주소창 옆 <b>⋯</b>을 먼저 누르세요.`, '목록을 내려 <b>홈 화면에 추가</b>를 누르세요.', '오른쪽 위 <b>추가</b>를 누르세요.'],
+  'ios-chrome': [`주소창 오른쪽의 ${SHARE}을 누르세요. 안 보이면 <b>⋯</b> 메뉴에서 <b>공유</b>를 누르세요.`, '목록을 내려 <b>홈 화면에 추가</b>를 누르세요.', '오른쪽 위 <b>추가</b>를 누르세요.'],
+  'ios-other': [`브라우저의 ${SHARE}을 누르세요.`, '<b>홈 화면에 추가</b>를 누르세요. 목록에 없으면 이 주소를 Safari로 열어주세요.'],
+  android: ['오른쪽 위 <b>⋮</b> 메뉴를 누르세요.', '<b>홈 화면에 추가</b> 또는 <b>앱 설치</b>를 누르세요.', '<b>설치</b>를 누르세요.'],
+  samsung: ['아래쪽 <b>≡</b> 메뉴를 누르세요.', '<b>현재 페이지 추가</b> → <b>홈 화면</b>을 누르세요.'],
+  desktop: ['주소창 오른쪽의 <b>설치</b> 아이콘을 누르세요.', '안 보이면 <b>⋮</b> 메뉴에서 <b>앱 설치</b> 또는 <b>홈 화면에 추가</b>를 누르세요.'],
+};
+
+function guideHtml(kind) {
+  if (kind === 'inapp') {
+    const kakao = /KAKAOTALK/i.test(UA);
+    return `<p class="sheet-note">메신저 안에서 열린 화면에서는 홈 화면에 추가할 수 없어요. <b>${isIOS() ? 'Safari' : 'Chrome'}</b>${isIOS() ? '로' : '으로'} 다시 열어주세요.</p>
+      <ol class="steps">${kakao
+        ? `<li>${isIOS() ? '오른쪽 아래' : '오른쪽 위'} <b>⋯</b> 메뉴를 누르세요.</li><li><b>${isIOS() ? 'Safari로 열기' : '다른 브라우저로 열기'}</b>를 누르세요.</li>`
+        : '<li>메뉴에서 <b>브라우저로 열기</b>를 누르세요.</li><li>메뉴가 없으면 아래 주소를 복사해서 브라우저에 붙여넣으세요.</li>'}
+        <li>열린 브라우저에서 다시 <b>정보 → 홈 화면에 추가하기</b>를 누르세요.</li></ol>
+      <p class="url-box">${esc(appUrl())}</p>
+      <div class="actions">${kakao ? `<a class="btn primary" href="kakaotalk://web/openExternal?url=${encodeURIComponent(appUrl())}">다른 브라우저로 열기</a>` : ''}<button class="btn" type="button" data-act="copyLink">주소 복사</button></div>`;
   }
-  return `<div class="install ${onLock ? '' : 'panel'}"><h3>홈 화면에 앱으로 설치하기</h3>
-    <ol><li>Chrome 오른쪽 위 <b>⋮</b> 메뉴를 누르세요.</li><li><b>홈 화면에 추가</b> 또는 <b>앱 설치</b>를 누르세요.</li></ol>
-    ${S.installEvt ? '<div class="actions"><button class="btn green" type="button" data-act="install">지금 설치</button></div>' : ''}</div>`;
+  const steps = INSTALL_STEPS[kind] || INSTALL_STEPS.android;
+  return `<ol class="steps">${steps.map(t => `<li>${t}</li>`).join('')}<li>홈 화면에 생긴 <b>re:Invent</b> 아이콘으로 여세요.</li></ol>
+    ${isIOS() ? '<p class="sheet-note">아이콘으로 처음 열 때 보기 비밀번호를 한 번 더 넣어주세요. 인터넷이 될 때 한 번 열어둬야 오프라인에서도 열려요.</p>' : ''}`;
+}
+
+// 잠금 화면에 바로 보여주는 안내
+function installHtml() {
+  const kind = installKind();
+  if (kind === 'installed') return '';
+  if (kind === 'prompt') return '<div class="install"><h3>홈 화면에 앱으로 추가</h3><div class="actions"><button class="btn green" type="button" data-act="install">홈 화면에 추가하기</button></div></div>';
+  return `<div class="install"><h3>${kind === 'inapp' ? '브라우저에서 열어주세요' : '홈 화면에 앱으로 추가'}</h3>${guideHtml(kind)}</div>`;
+}
+
+// 정보 탭 버튼 영역
+function installPanel() {
+  if (installKind() === 'installed') return '<div class="panel"><h3>홈 화면 앱</h3><p class="muted">지금 홈 화면 앱으로 열려 있어요. 인터넷이 없어도 마지막 저장본이 보여요.</p></div>';
+  return `<div class="panel"><h3>홈 화면에 추가</h3><p class="muted">아이콘을 누르면 앱처럼 전체 화면으로 열리고, 인터넷이 없어도 일정이 보여요.</p>
+    <div class="actions"><button class="btn green" type="button" data-act="install">홈 화면에 추가하기</button></div></div>`;
+}
+
+async function doInstall() {
+  const kind = installKind();
+  if (kind === 'prompt' && S.installEvt) {
+    const evt = S.installEvt;
+    S.installEvt = null;
+    try {
+      await evt.prompt();
+      const r = await evt.userChoice;
+      if (r && r.outcome === 'accepted') toast('홈 화면에 추가했어요.');
+    } catch { openSheet({ title: '홈 화면에 추가하기', html: guideHtml(isIOS() ? 'ios-safari' : 'android'), submit: '알겠어요', noCancel: true, onSubmit: closeSheet }); }
+    refreshInstallUi();
+    return;
+  }
+  openSheet({ title: kind === 'inapp' ? '브라우저에서 열어주세요' : '홈 화면에 추가하기', html: guideHtml(kind), submit: '알겠어요', noCancel: true, onSubmit: closeSheet });
+}
+
+function refreshInstallUi() {
+  if (!$('lock').hidden) $('lockInstall').innerHTML = installHtml();
+  if (S.tab === 'info' && S.model && !$('app').hidden) renderInfo();
 }
 
 function renderInfo() {
@@ -438,6 +501,7 @@ function renderInfo() {
       </div>
       ${S.edit ? '<div class="actions"><button class="btn primary" type="button" data-act="editTrip">여행 정보 수정</button></div>' : ''}
     </div>
+    ${installPanel()}
     <div class="panel">
       <h3>출장자</h3>
       <p>${people.map(esc).join(' · ') || '—'}</p>
@@ -457,7 +521,6 @@ function renderInfo() {
       <p class="muted">위쪽 <b>편집</b> 버튼을 누르고 편집 비밀번호를 넣으면 일정과 장소를 추가·수정·삭제할 수 있어요. ${S.model.settings.editHash ? '' : '아직 편집 비밀번호가 없어서, 처음 편집할 때 정하게 돼요.'}</p>
       ${S.edit ? '<div class="actions"><button class="btn" type="button" data-act="setEditPw">편집 비밀번호 바꾸기</button></div>' : ''}
     </div>
-    ${installHtml(false)}
     <div class="panel">
       <h3>이 기기</h3>
       <p class="muted">로그인 정보와 이 기기에 저장된 일정을 지웁니다. 다시 열면 비밀번호를 물어요.</p>
@@ -494,13 +557,13 @@ function field(f) {
   return `<div class="fg ${f.half ? 'half' : ''}"><label for="${id}">${esc(f.label)}${f.required ? ' <em>*</em>' : ''}</label>${input}${help}</div>`;
 }
 
-function openSheet({ title, fields, submit, danger, onSubmit, onDanger, note }) {
+function openSheet({ title, fields = [], html = '', submit, danger, onSubmit, onDanger, note, noCancel }) {
   S.sheet = { onSubmit, onDanger };
   $('sheetTitle').textContent = title;
-  $('sheetForm').innerHTML = `${note ? `<p class="sheet-note">${note}</p>` : ''}<div class="fields">${fields.map(field).join('')}</div>
+  $('sheetForm').innerHTML = `${note ? `<p class="sheet-note">${note}</p>` : ''}${html}${fields.length ? `<div class="fields">${fields.map(field).join('')}</div>` : ''}
     <p class="form-err" id="formErr" role="alert"></p>
     <div class="sheet-actions">${danger ? `<button type="button" class="btn danger" data-act="sheetDanger">${esc(danger)}</button>` : ''}<span class="spacer"></span>
-      <button type="button" class="btn" data-act="closeSheet">취소</button><button type="submit" class="btn primary">${esc(submit)}</button></div>`;
+      ${noCancel ? '' : '<button type="button" class="btn" data-act="closeSheet">취소</button>'}<button type="submit" class="btn primary">${esc(submit)}</button></div>`;
   $('sheet').hidden = false;
   document.body.classList.add('noscroll');
   const first = $('sheetForm').querySelector('input:not([type=checkbox]),textarea,select');
@@ -709,7 +772,11 @@ document.addEventListener('click', e => {
       break;
     }
     case 'check': checkServer(); break;
-    case 'install': if (S.installEvt) { S.installEvt.prompt(); S.installEvt = null; } break;
+    case 'install': doInstall(); break;
+    case 'copyLink':
+      if (navigator.clipboard) navigator.clipboard.writeText(appUrl()).then(() => toast('주소를 복사했어요. 브라우저 주소창에 붙여넣어 주세요.'), () => toast('복사하지 못했어요. 주소를 길게 눌러 복사해주세요.'));
+      else toast('주소를 길게 눌러 복사해주세요.');
+      break;
     case 'forget': forgetDevice(); break;
     case 'editSession': openSessionSheet(v); break;
     case 'delSession': if (confirm('이 일정을 삭제할까요?')) remove('sessions', v, '일정을 삭제했어요.'); break;
@@ -753,7 +820,8 @@ window.addEventListener('offline', renderHeader);
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && S.model && S.tab === 'schedule') renderScheduleBody(); // '진행 중' 표시 갱신
 });
-window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; if (S.tab === 'info' && S.model) renderInfo(); });
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; refreshInstallUi(); });
+window.addEventListener('appinstalled', () => { S.installEvt = null; toast('홈 화면에 추가했어요.'); refreshInstallUi(); });
 
 /* ---------- 시작 ---------- */
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});

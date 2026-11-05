@@ -200,3 +200,9 @@ body.editing .toast{bottom:calc(var(--tabs-h) + 84px + env(safe-area-inset-botto
 @media (max-width:380px){.top{padding-left:14px;padding-right:12px}.top h1{font-size:15.5px}.edit-btn:not(.on) #editText{display:none}.edit-btn{padding:7px 9px}.sync-pill{padding:7px 9px}}
 .hero .pills a.map-pill{display:inline-flex;align-items:center;background:#0b0c0c;color:#63E5CE;border-radius:999px;padding:5px 11px;font-size:13px;font-weight:800;text-decoration:none}
 .map-row{margin:12px 0 0}
+.steps{margin:4px 0 10px;padding-left:22px;font-size:14.5px;line-height:1.7}
+.steps li{margin-bottom:4px}
+.url-box{margin:8px 0 0;padding:9px 11px;border-radius:10px;background:var(--soft);font-size:13px;word-break:break-all;user-select:all;-webkit-user-select:all}
+#lockInstall .steps{font-size:13.5px}
+#lockInstall .sheet-note{color:#bfc2bf;font-size:13px;margin:6px 0 0}
+#lockInstall .url-box{background:#232625;color:#e8e8e4}
