@@ -198,3 +198,5 @@ body.editing .toast{bottom:calc(var(--tabs-h) + 84px + env(safe-area-inset-botto
 .top h1{font-size:17px}
 .sync-pill{padding:7px 11px}
 @media (max-width:380px){.top{padding-left:14px;padding-right:12px}.top h1{font-size:15.5px}.edit-btn:not(.on) #editText{display:none}.edit-btn{padding:7px 9px}.sync-pill{padding:7px 9px}}
+.hero .pills a.map-pill{display:inline-flex;align-items:center;background:#0b0c0c;color:#63E5CE;border-radius:999px;padding:5px 11px;font-size:13px;font-weight:800;text-decoration:none}
+.map-row{margin:12px 0 0}

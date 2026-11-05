@@ -10,7 +10,7 @@ import {
 } from './vendor/firebase.js';
 import { firebaseConfig, VIEWER_EMAIL, viewerPassword, emulator } from './firebase-config.js';
 
-const APP_VERSION = '2.0.0';
+const APP_VERSION = '2.1.0';
 const COLS = ['sessions', 'places', 'meta'];
 const K = { person: 'rv.person', tab: 'rv.tab', cat: 'rv.cat', lastSync: 'rv.lastSync' };
 const store = {
@@ -34,6 +34,7 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const linkify = s => esc(s).replace(/https?:\/\/[^\s<>"')]+/g, u => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`);
 const pad = n => String(n).padStart(2, '0');
+const safeUrl = u => /^https:\/\/\S+$/i.test(String(u || ''));
 
 /* ---------- Firebase ---------- */
 function initFirebase() {
@@ -108,7 +109,7 @@ async function checkServer() {
 function buildModel() {
   const metaDoc = S.raw.meta.find(d => d.id === 'trip');
   const settings = S.raw.meta.find(d => d.id === 'settings') || {};
-  const meta = { title: 'AWS re:Invent 2026', start: '', end: '', location: '', note: '', ...(metaDoc || {}) };
+  const meta = { title: 'AWS re:Invent 2026', start: '', end: '', location: '', note: '', mapUrl: '', ...(metaDoc || {}) };
   const sessions = S.raw.sessions.map(d => ({ ...d, attendees: Array.isArray(d.attendees) ? d.attendees : [] }))
     .sort((a, b) => (a.date || '').localeCompare(b.date || '') || (a.start || '99').localeCompare(b.start || '99') || (a.title || '').localeCompare(b.title || ''));
   const places = S.raw.places.map(d => ({ ...d }));
@@ -365,6 +366,7 @@ function renderPlaces() {
       <button class="chip ${S.cat === 'all' ? 'active' : ''}" data-act="cat" data-v="all">전체<small>${places.length}</small></button>
       ${cats.map(c => `<button class="chip ${S.cat === c[0] ? 'active' : ''}" data-act="cat" data-v="${c[0]}">${esc(c[1])}<small>${counts.get(c[0])}</small></button>`).join('')}
     </div>
+    ${safeUrl(S.model.meta.mapUrl) ? `<div class="actions map-row"><a class="btn primary" href="${esc(S.model.meta.mapUrl)}" target="_blank" rel="noopener">${ICON_MAP}구글 공유맵 열기</a></div>` : ''}
     ${hotel ? `<p class="hint">거리는 숙소(${esc(hotel.k || hotel.n)})에서 잰 직선거리예요. 영업시간·예약은 방문 전에 공식 사이트에서 확인하세요.</p>` : ''}
     ${shown.map(c => `
       <h3 class="section-title">${esc(c[2])}${c[3] ? `<small>${esc(c[3])}</small>` : ''}</h3>
@@ -432,6 +434,7 @@ function renderInfo() {
       <div class="pills">
         ${meta.start && meta.end ? `<span>${esc(dayLabel(meta.start))} ~ ${esc(dayLabel(meta.end))}</span>` : ''}
         ${meta.location ? `<span>${esc(meta.location)}</span>` : ''}
+        ${safeUrl(meta.mapUrl) ? `<a class="map-pill" href="${esc(meta.mapUrl)}" target="_blank" rel="noopener">구글 공유맵 ↗</a>` : ''}
       </div>
       ${S.edit ? '<div class="actions"><button class="btn primary" type="button" data-act="editTrip">여행 정보 수정</button></div>' : ''}
     </div>
@@ -644,12 +647,14 @@ function openTripSheet() {
       { name: 'start', label: '시작일', type: 'date', value: m.start, half: true },
       { name: 'end', label: '종료일', type: 'date', value: m.end, half: true },
       { name: 'location', label: '장소', value: m.location },
+      { name: 'mapUrl', label: '구글 공유맵 링크', type: 'url', inputmode: 'url', value: m.mapUrl, ph: 'https://maps.app.goo.gl/…', help: '구글 지도에서 장소 목록을 공유한 링크예요. 맛집 화면과 정보 화면에 버튼으로 나와요.' },
       { name: 'note', label: '메모', type: 'textarea', rows: 3, value: m.note },
     ],
     onSubmit: v => {
       if (!v.title) { formErr('이름을 넣어주세요.'); return; }
       if (v.start && v.end && v.end < v.start) { formErr('종료일이 시작일보다 빨라요.'); return; }
-      write('meta', 'trip', { title: v.title, start: v.start || '', end: v.end || '', location: v.location || '', note: v.note || '' }, '여행 정보를 고쳤어요.');
+      if (v.mapUrl && !safeUrl(v.mapUrl)) { formErr('공유맵 링크는 https://로 시작해야 해요.'); return; }
+      write('meta', 'trip', { title: v.title, start: v.start || '', end: v.end || '', location: v.location || '', mapUrl: v.mapUrl || '', note: v.note || '' }, '여행 정보를 고쳤어요.');
     },
   });
 }
